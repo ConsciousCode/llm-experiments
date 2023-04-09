@@ -1,0 +1,9 @@
+depth = 2
+block_size = 4096
+# LLaMA uses 11008:4096 = 688:256
+interm_size = 688
+embed_size = 256
+token_size = 256
+head_count = 1
+lr = 1e-5
+filename = "orin.pt"
