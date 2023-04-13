@@ -1,14 +1,14 @@
 print("import torch")
 import torch
-#import torch.optim as optim
+import torch.optim as optim
 from torch.utils.data import DataLoader
-#import torch.nn as nn
-#import torch.nn.functional as F
+import torch.nn as nn
+import torch.nn.functional as F
 
 print("import lightning")
-#import lightning as pl
-#from lightning.pytorch.callbacks import LearningRateMonitor, Callback
-#from lightning.pytorch import Trainer, LightningModule
+import lightning as pl
+from lightning.pytorch.callbacks import LearningRateMonitor, Callback
+from lightning.pytorch import Trainer, LightningModule
 
 print("import transformers")
 from transformers.models.gpt2 import GPT2LMHeadModel, GPT2TokenizerFast, GPT2Config
@@ -16,116 +16,70 @@ from transformers.models.gpt2 import GPT2LMHeadModel, GPT2TokenizerFast, GPT2Con
 print("import datasets")
 from datasets import load_dataset
 
-#from collections import OrderedDict
+from collections import OrderedDict
 import os
+import re
 
 print("import model")
 import model
 import knn
 print("Done")
 
-os.environ["TOKENIZERS_PARALLELISM"] = "true"
-
-config = GPT2Config.from_pretrained("gpt2")
-tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
-tokenizer.pad_token = tokenizer.eos_token
-student = model.InfoDistilleryGPT2Model(config)
-student = model.InfoDistilleryLMHeadModel(student)
-student = model.TransformersWrapper(student)
-
-dataset = ''.join(chr(x) for x in range(32, 128)) + ''.join(chr(x) for x in range(200, 600))
-
-def _collate(batch):
-	'''
-	Collates the inputs as (seq*batch,) tensors because of weirdness with
-	how torch handles parallelism, which can exhaust file descriptors:
-	https://github.com/pytorch/pytorch/issues/65198
-	'''
-	input_ids = [torch.tensor(item['input_ids']) for item in batch]
-	attention_mask = [torch.tensor(item['attention_mask']) for item in batch]
-
-	input_ids = torch.stack(input_ids, dim=0)
-	attention_mask = torch.stack(attention_mask, dim=0)
-	
-	return {"input_ids": input_ids, "attention_mask": attention_mask}
-
-dataset = tokenizer(dataset,
-	truncation=True,
-	padding="max_length",
-	max_length=config.n_positions
-)
-dataloader = DataLoader([dataset], 1, num_workers=8, collate_fn=_collate)
-
-output = student(**next(iter(dataloader)))
-print(output)
-
-exit()
-
+TEACHER = "gpt2"
 CACHE_FILE = "dataloader-map.cache"
 
-def map_gpt2_to_infostill(key):
-	pre, *key = teacher_key.split(".")
-	if pre != "transformer":
+os.environ["TOKENIZERS_PARALLELISM"] = "true"
+
+torch.set_float32_matmul_precision('medium')
+pl.seed_everything(42)
+
+def map_gpt2_to_mine(teacher):
+	if 'wpe' in teacher:
 		return None
 	
-	match key:
-		case ['wte', 'weight']: return "token_embed.weight"
-		case ["ln_f", "weight"]: return "postnorm.weight"
-		case ['h', l, "attn", *_]: layer = l
-		case _: return None
-	
-	match key[3:]:
-		# ln_2 is FF layer norm so skip
-		case ["ln_1", wb]: key = f"prenorm.{wb}"
-		
-		# Skip mlp layer and biases
-		case ["c_attn", "weight"]: key = f"qkv_proj.weight"
-		case ["c_proj", "weight"]: key = f"out_proj.weight"
-		
-		# Causal mask bias
-		case ["bias"]: key = "attention.bias"
-		
-		case _: return None
-	
-	return f"layers.{layer}.{key}"
+	student = (teacher
+		.replace("transformer.", "lm.")
+		.replace(".c_attn.", ".attn.qkv_proj.")
+		.replace(".c_proj.", ".attn.out_proj.")
+		.replace("wte.", "embed.")
+	)
+
+	return re.sub(r"lm\.h\.(\d+)\.", r"lm.\1.MyModelBlock.", student)
+
 
 print("Loading teacher")
 
-teacher_name = "gpt2"
-teacher = GPT2LMHeadModel.from_pretrained(teacher_name)
-tokenizer = GPT2TokenizerFast.from_pretrained(teacher_name)
-print("Loading teacher")
-
-teacher_name = "gpt2"
-teacher = GPT2LMHeadModel.from_pretrained(teacher_name)
-tokenizer = GPT2TokenizerFast.from_pretrained(teacher_name)
+teacher = GPT2LMHeadModel.from_pretrained(TEACHER)
+tokenizer = GPT2TokenizerFast.from_pretrained(TEACHER)
 tokenizer.pad_token = tokenizer.eos_token
 config = teacher.config
-
+#print(list(teacher.state_dict().keys()))
+#exit()
 #print("Config:", config)
 print("Done")
 
 print("Building student")
 
-student = model.InfoDistilleryGPT2Model(config)
-tokenizer.pad_token = tokenizer.eos_token
-config = teacher.config
+student = model.MyGPT2Model(config)
+student = model.LanguageModel(config.vocab_size, config.n_embd, student)
+#student = model.TransformersWrapper(student)
+#print(student)
+#exit()
+memory = knn.TestDatabase(config.n_embd, "test.db")
 
 #print("Config:", config)
 print("Done")
-
-print("Building student")
-
-student = model.InfoDistilleryGPT2Model(config)
-student_state = OrderedDict()
 
 print("Transfer weights")
 
-for teacher_key, teacher_weight in teacher.state_dict().items():
-	student_key = map_gpt2_to_infostill(teacher_key)
+student_state = OrderedDict()
+
+for teacher, teacher_weight in teacher.state_dict().items():
+	student_key = map_gpt2_to_mine(teacher)
 	if student_key is None:
 		continue
 	if 'proj' in student_key:
+		print(teacher_weight.shape)
 		teacher_weight = teacher_weight.T
 	student_state[student_key] = teacher_weight
 
@@ -134,7 +88,7 @@ print("Done")
 
 class KnowledgeDistillationModel(pl.LightningModule):
 	def __init__(self,
-	      teacher, student, memory, tokenizer, dataset,
+		  teacher, student, memory, tokenizer, dataset,
 		  *,
 		  temperature=2.0,
 		  batch_size=8,
@@ -220,7 +174,7 @@ class KnowledgeDistillationModel(pl.LightningModule):
 	def _dataloader(self, split):
 		def tokenize(dataset):
 			return self.tokenizer(dataset['text'],
-		    	truncation=True,
+				truncation=True,
 				padding="max_length",
 				max_length=self.max_length
 			)
@@ -249,7 +203,6 @@ class FrequentCheckpoint(Callback):
 			trainer.save_checkpoint(ckpt_path)
 			print(f"Checkpoint saved at step {global_step}: {ckpt_path}")
 
-pl.seed_everything(42)
 block_size = config.n_positions
 dataset = load_dataset("ag_news")
 
@@ -257,7 +210,6 @@ memory = knn.KNNMemory("orin", config.n_embd, config.n_embd)
 print("Done")
 
 print("Begin training")
-torch.set_float32_matmul_precision('medium')
 
 # Train the model
 model = KnowledgeDistillationModel(

@@ -1,112 +1,230 @@
-from pymilvus import connections, DataType, CollectionSchema, FieldSchema, Collection
 import torch
+import faiss
+import numpy as np
+from abc import ABC, abstractmethod
+import pickle
+import os
 
-class ExternalMemory(torch.autograd.Function):
+def numpy_cast(x: torch.Tensor|np.ndarray) -> np.ndarray:
 	'''
-	Discretized external memory query-and-update operation. The external memory
-	should approximate attention over an arbitrarily large external memory vector.
+	Cast input tensor into numpy array.
+	'''
+	if torch.is_tensor(x):
+		x = x.cpu().numpy()
+	return x
+
+def torch_cast(x: np.ndarray) -> torch.Tensor:
+	'''
+	Cast back from numpy to torch - assumes the input is numpy.
+	'''
+	return torch.from_numpy(x)
+
+class Index(ABC):
+	'''
+	One-way map from keys (via nearest neighbor) to indices.
+	'''
 	
-	1. Query a number of entries from the memory
-	2. Use the gate to select keys and values and the add/erase operation
-	3. Update the memory with the new keys and values
-	4. Return the original query
+	@abstractmethod
+	def add(self, k: np.array) -> np.array:
+		'''
+		Add keys to the index and return the indices
+		
+		Parameters:
+			k: Keys to add, dimensions (batch, dim)
+		
+		Returns: Indices of the keys, dimensions (batch,)
+		'''
+		pass
+	
+	@abstractmethod
+	def search(self, q: np.array) -> np.array:
+		'''
+		Search for the approximate nearest neighbors of the queries and return
+		the distances and indices.
+		
+		Parameters:
+			q: Queries, dimensions (batch, dim)
+		
+		Returns: tuple of distances and indices, dimensions (batch, k)
+		
+		k is a parameter of the index and may be 1.
+		'''
+		pass
+	
+	def flush(self):
+		'''
+		Flushes the index to disk. By default, does nothing.
+		'''
+		pass
+
+class Store(ABC):
+	'''
+	Stores values at indices.
 	'''
 	
-	@staticmethod
-	def forward(ctx, q, k, v, memory):
+	@abstractmethod
+	def get(self, i):
 		'''
+		Gets the values at the indices.
+		
 		Parameters:
-			q: Query vector
-			k: Key vector
-			v: Value vector
-			g: Gate vector, usually a sigmoid
-			mem: Memory interface
-			remember: Number of entries to remember per query
+			i: Indices, dimensions (batch,)
 		
-		If remember/retain/forget are 0, query/add/remove operations are skipped.
+		Returns: Tuple-like of columns with height `batch`. The first entry
+		should be the key.
 		'''
-		print("qkv", q.shape, k.shape, v.shape)
+		pass
+	
+	@abstractmethod
+	def set(self, i, v):
+		'''
+		Stores the values at the indices.
 		
-		mk, mv = memory.search(q)
-		memory.add(k, v)
-		return mk, mv
-
-	@staticmethod
-	def backward(ctx, mk_grad, mv_grad):
-		'''
 		Parameters:
-			mk_grad: Gradient of memory keys
-			mv_grad: Gradient of memory values
-		
-		This uses STE to approximate the gradient of the memory.
+			i: Indices, dimensions (batch,)
+			v: Values, list-like of rows with length `batch`
 		'''
-		
-		return mk_grad, mk_grad, mv_grad, None
+		pass
+	
+	def flush(self):
+		'''
+		Flushes the store to disk. By default, does nothing.
+		'''
+		pass
 
-from vespa.application import ApplicationPackage
-from vespa.package import Field, Document, Schema
-import torch
-
-class KNNMemory:
+class FaissIndex(Index):
 	'''
-	kNN memory interfacing with the Vespa database.
+	Index using faiss for approximate nearest neighbor search.
 	'''
-
-	def __init__(self, name, kdim, vdim):
-		self.name = name
-		self.kdim = kdim
-		self.vdim = vdim
-
-		# Define the schema
-		self.app = ApplicationPackage(name, [
-			Schema("infostill",
-				Document([
-					Field("id", "int", indexing=["attribute"], attribute=["fast-search"]),
-					Field("key", f"tensor<float>(x[{kdim}])", indexing=["attribute"], attribute=["fast-search"]),
-					Field("value", f"tensor<float>(x[{vdim}])", indexing=["attribute"])
-				])
-			)
-		])
-
-	def add(self, keys, values):
-		assert keys.shape[:-1] == values.shape[:-1], "Keys and values should have matching batch and sequence dimensions"
+	
+	def __init__(self, dim, path: str, k=1, *, index="hnsw", centroids=4096, probes=32, bits=8):
+		self.dim = dim
+		self.path = path
+		self.k = k
 		
-		keys = keys.reshape(-1, keys.shape[-1])
-		vals = values.reshape(-1, values.shape[-1])
-
-		for key, val in zip(keys, vals):
-			self.app.feed_data_point(
-				schema="infostill",
-				data_id=int(self.app.get_data_count("infostill")),
-				fields={
-					"key": key.tolist(),
-					"value": val.tolist()
-				}
-			)
-
-	def search(self, queries, top_k=1):
-		print("Search", queries.shape, queries)
-		batch, seq, dim = queries.shape
-		queries = queries.reshape(-1, dim)
+		if os.path.exists(path):
+			self.index = faiss.read_index(path)
+		else:
+			match index.lower():
+				case "ivfpq":
+					quantizer = faiss.IndexFlatL2(dim)
+					index = faiss.IndexIVFPQ(quantizer, dim, centroids, 8, bits)
+				
+				case "ivfflat":
+					quantizer = faiss.IndexFlatL2(dim)
+					index = faiss.IndexIVFFlat(quantizer, dim, centroids)
+				
+				case "flat": index = faiss.IndexFlatL2(dim)
+				case "pq": index = faiss.IndexPQ(dim, 8, bits)
+				case "lsh": index = faiss.IndexLSH(dim, bits)
+				case "hnsw": index = faiss.IndexHNSWFlat(dim, bits)
+				case "hnsw2": index = faiss.IndexHNSW2Flat(dim, bits)
+				
+				case _: raise ValueError(f"Unknown index type {index}")
+			
+			index.nprobe = probes
+			index.metric_type = faiss.METRIC_INNER_PRODUCT
+			self.index = index
+	
+	def __len__(self):
+		return self.index.ntotal
+	
+	def add(self, k):
+		old = len(self)
+		self.index.add(k)
+		return np.arange(old, len(self))
+	
+	def search(self, q):
+		batch, dim = q.shape
+		assert dim == self.dim, f"key dim {dim} does not match index dim {self.dim}"
 		
-		keys = torch.empty((batch, seq * top_k, dim), dtype=torch.float32)
-		values = torch.empty((batch, seq * top_k, dim), dtype=torch.float32)
+		return self.index.search(q, self.k)
+	
+	def flush(self):
+		faiss.write_index(self.index, self.path)
 
-		for i, query in enumerate(queries):
-			ann_query = {
-				"yql": "select * from sources * where ([{'targetHits':%(top_k)s}]nearestNeighbor(key, key_embedding));",
-				"ranking.profile": "my_profile",
-				"ranking.features.query(key_embedding)": query.tolist(),
-				"hits": top_k
-			}
+class PickleStore(Store):
+	'''
+	Store using pickle for serialization. Probably don't use this
+	except as a proof of concept.
+	'''
+	
+	def __init__(self, dim, path):
+		self.dim = dim
+		self.path = path
+		if os.path.exists(path):
+			with open(self.path, "rb") as f:
+				self.store = pickle.load(f)
+		else:
+			self.store = {}
+	
+	def __len__(self):
+		return len(self.store)
+	
+	def get(self, idx):
+		w, h = idx.shape
+		result = np.empty((w, h, self.dim), dtype=np.float32)
+		for i in range(w):
+			for j in range(h):
+				result[i, j] = self.store[idx[i, j]]
+		return result
+	
+	def set(self, idx, v):
+		# idx: (batch,)
+		# v: (batch, dim)
+		for x, i in enumerate(np.nditer(idx)):
+			self.store[i.item()] = v[x]
+	
+	def flush(self):
+		with open(self.path, "wb") as f:
+			pickle.dump(self.store, f)
 
-			result = self.app.query(body=ann_query)
-			row = i // seq
-			col = (i % seq) * top_k * dim
+class Database:
+	'''
+	Combines an index and a store to form a key-value/metadata mapping database.
+	This is the main interface which handles both numpy and torch tensors.
+	Everything else in this file uses numpy.
+	'''
+	
+	def __init__(self, index, store, training=True):
+		self.index = index
+		self.store = store
+		self.training = training
+	
+	def add(self, k, v):
+		k = k.reshape(-1, k.shape[-1])
+		k = numpy_cast(k)
+		
+		v = v.reshape(-1, v.shape[-1])
+		v = numpy_cast(v)
+		
+		i = self.index.add(k)
+		self.store.set(i, v)
+	
+	def search(self, q):
+		batch, seq, dim = q.shape
+		q = q.reshape(-1, dim)
+		q = numpy_cast(q)
+		
+		# Edge case for when the index is empty
+		can_add = True
+		if len(self.index) == 0:
+			can_add = False
+			self.add(q, q)
+		
+		d, i = self.index.search(q)
+		if self.training and can_add:
+			self.add(q, q)
+		return torch_cast(self.store.get(i).reshape(batch, seq, -1, dim))
+	
+	def flush(self):
+		self.index.flush()
+		self.store.flush()
 
-			for hit in result.hits:
-				keys[row, col:col + dim] = torch.tensor(hit["fields"]["key"], dtype=torch.float32)
-				values[row, col:col + dim] = torch.tensor(hit["fields"]["value"], dtype=torch.float32)
-				col += dim
-
-		return keys, values
+class TestDatabase(Database):
+	'''
+	Proof of concept database.
+	'''
+	
+	def __init__(self, dim, path):
+		super().__init__(FaissIndex(dim, path + ".index"), PickleStore(dim, path + ".store"))
