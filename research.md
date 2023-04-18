@@ -1,5 +1,5 @@
 
-T5's Simplified Realtive Positional Encoding
+T5's Simplified Relative Positional Encoding
 https://arxiv.org/abs/1910.10683
 * Simplified relative positional endcoding based on learned bias
 

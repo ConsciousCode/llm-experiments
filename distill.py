@@ -1,3 +1,9 @@
+#!/usr/bin/env python3
+'''
+Distill GPT-2 to a model using static memory layers. No CLI, just run it.
+'''
+# Prints to help my impatient ass know it's not dead
+
 print("import torch")
 import torch
 import torch.optim as optim
@@ -23,10 +29,17 @@ import re
 print("import model")
 import model
 import knn
-print("Done")
+
+###################
+## Configuration ##
+###################
 
 TEACHER = "gpt2"
 CACHE_FILE = "dataloader-map.cache"
+DATASET = "ag_news"
+BATCHES = 4 # 8 exhausts my 12 GB VRAM with a mere 12 layers
+EPOCHS = 3
+LOG_STEPS = 8
 
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
 
@@ -44,8 +57,7 @@ def map_gpt2_to_mine(teacher):
 		.replace("wte.", "embed.")
 	)
 
-	return re.sub(r"lm\.h\.(\d+)\.", r"lm.\1.MyModelBlock.", student)
-
+	return re.sub(r"lm\.h\.(\d+)\.", r"lm.\1.DMTransformerBlock.", student)
 
 print("Loading teacher")
 
@@ -56,35 +68,30 @@ config = teacher.config
 #print(list(teacher.state_dict().keys()))
 #exit()
 #print("Config:", config)
-print("Done")
 
 print("Building student")
 
-student = model.MyGPT2Model(config)
-student = model.LanguageModel(config.vocab_size, config.n_embd, student)
-#student = model.TransformersWrapper(student)
+student = model.DMGPT2Model(config)
+student = model.LanguageModel(config.vocab_size, config.n_embd, config.n_positions, student)
 #print(student)
 #exit()
 memory = knn.TestDatabase(config.n_embd, "test.db")
 
 #print("Config:", config)
-print("Done")
 
 print("Transfer weights")
 
 student_state = OrderedDict()
 
-for teacher, teacher_weight in teacher.state_dict().items():
-	student_key = map_gpt2_to_mine(teacher)
-	if student_key is None:
+for tk, tw in teacher.state_dict().items():
+	sk = map_gpt2_to_mine(tk)
+	if sk is None:
 		continue
-	if 'proj' in student_key:
-		print(teacher_weight.shape)
-		teacher_weight = teacher_weight.T
-	student_state[student_key] = teacher_weight
+	if 'proj' in sk and len(tw.shape) > 1:
+		tw = tw.T
+	student_state[sk] = tw
 
 student.load_state_dict(student_state, strict=False)
-print("Done")
 
 class KnowledgeDistillationModel(pl.LightningModule):
 	def __init__(self,
@@ -100,7 +107,6 @@ class KnowledgeDistillationModel(pl.LightningModule):
 		self.memory = memory
 		self.tokenizer = tokenizer
 		self.dataset = dataset
-		self.feedback = None
 		self.batch_size = batch_size
 		self.max_length = max_length
 		self.temperature = temperature
@@ -111,7 +117,8 @@ class KnowledgeDistillationModel(pl.LightningModule):
 		input_ids, attention_mask = batch
 		input_ids = input_ids.reshape(self.batch_size, self.max_length)
 		attention_mask = attention_mask.reshape(self.batch_size, self.max_length)
-		labels = input_ids
+		labels = student.embed(input_ids, positional=False)
+		
 		print("input", type(input_ids), input_ids)
 		#input_ids = torch.stack(input_ids, dim=0)
 		#attention_mask = torch.stack(attention_mask, dim=0)
@@ -127,14 +134,13 @@ class KnowledgeDistillationModel(pl.LightningModule):
 			).logits
 
 		# Student model output
-		student_logits, hidden = self.student(
+		student_logits, output = self.student(
 			input_ids,
 			attention_mask=attention_mask,
-			memory=self.memory,
-			feedback=self.feedback
+			static_memory=self.memory
 		)
-		print("hidden shape", hidden.shape)
-		self.feedback = hidden[1:] + [None]
+		
+		print("shape", input_ids.shape, teacher_logits.shape, student_logits.shape)
 
 		# Calculate distillation loss
 		distill_loss = self.distill_loss(
@@ -191,6 +197,9 @@ class KnowledgeDistillationModel(pl.LightningModule):
 		return self._dataloader("test")
 
 class FrequentCheckpoint(Callback):
+	'''
+	Checkpoint mid-epoch, since they can last a long time.
+	'''
 	def __init__(self, save_steps: int, output_dir: str):
 		super().__init__()
 		self.save_steps = save_steps
@@ -204,10 +213,7 @@ class FrequentCheckpoint(Callback):
 			print(f"Checkpoint saved at step {global_step}: {ckpt_path}")
 
 block_size = config.n_positions
-dataset = load_dataset("ag_news")
-
-memory = knn.KNNMemory("orin", config.n_embd, config.n_embd)
-print("Done")
+dataset = load_dataset(DATASET)
 
 print("Begin training")
 
@@ -215,9 +221,9 @@ print("Begin training")
 model = KnowledgeDistillationModel(
 	teacher, student, memory, tokenizer, dataset,
 	max_length=config.n_positions,
-	batch_size=8
+	batch_size=BATCHES
 )
-trainer = pl.Trainer(accelerator="gpu", max_epochs=3, log_every_n_steps=8, callbacks=[
+trainer = pl.Trainer(accelerator="gpu", max_epochs=EPOCHS, log_every_n_steps=LOG_STEPS, callbacks=[
 	LearningRateMonitor(logging_interval='step'),
 	FrequentCheckpoint(save_steps=1000, output_dir="checkpoints")
 ])

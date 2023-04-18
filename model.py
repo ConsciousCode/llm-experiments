@@ -1,16 +1,4 @@
 #!/usr/bin/env python3
-'''
-Transformer library for PyTorch. Divides transformers into an unusual split for
-maximum flexibility:
-
-Transformer - residuals
-	Attention - projections and heads
-		Selector - query-key selector of values, eg softmax(Q K^T) V
-	Feedforward
-
-InfoStill - Transformer that adds feedback to every layer
-
-'''
 
 import torch
 import torch.nn as nn
@@ -46,43 +34,6 @@ def output_append(ctx, key, value):
 	out = ctx['output'].get(key, None)
 	if out is not None:
 		out.append(value)
-
-class RotaryEmbedding(nn.Module):
-	'''
-	Rotary Embedding (RoPE)
-	
-	RoFormer: Enhanced Transformer with Rotary Position Embedding
-	https://arxiv.org/abs/2104.09864
-	'''
-	
-	def __init__(self, dim, base=10000.0):
-		super().__init__()
-		self.dim = dim
-		self.cache = {}
-		inv_freq = base ** -(torch.arange(0, dim, 2).float() / dim)
-		emb = torch.empty(self.dim)
-		emb[::2] = inv_freq
-		emb[1::2] = inv_freq
-		self.register_buffer('inv_freq', emb)
-
-	def forward(self, q, k):
-		assert q.shape == k.shape
-		seq = q.shape[1]
-		
-		sc = self.cache.get(seq, None)
-		if sc is None:
-			sin, cos = torch.sin(seq * self.inv_freq), torch.cos(seq * self.inv_freq)
-			self.cache[seq] = sin, cos
-		else:
-			sin, cos = sc
-
-		def rotate(x):
-			# Rotate half
-			x1, x2 = x[..., :-1:2], x[..., 1::2]
-			x_rot = torch.cat((-x2, x1), dim=-1)
-			return (x * cos) + (x_rot * sin)
-		
-		return rotate(q), rotate(k)
 
 class ScaledDotProductSelector(nn.Module):
 	'''
@@ -150,11 +101,7 @@ class Attention(nn.Module):
 	def __init__(self,
 			embed: int,
 			*,
-			prenorm: ConfigMod=NORM,
-			dropout: ConfigMod=DROP,
-			postnorm: ConfigMod=None,
-			
-			bias=BIAS
+			dropout: ConfigMod=DROP
 		):
 		'''
 		Parameters:
@@ -170,10 +117,8 @@ class Attention(nn.Module):
 		super().__init__()
 		self.embed = embed
 		
-		self.prenorm = mod_or_config(prenorm, NORM, nn.LayerNorm)
 		self.resid_dropout = mod_or_config(dropout, DROP, nn.Dropout)
-		self.out_proj = nn.Linear(embed, embed, bias)
-		self.postnorm = mod_or_config(postnorm, NORM, nn.LayerNorm)
+		self.c_proj = nn.Linear(embed, embed)
 	
 	@abstractmethod
 	def _attention(self, x, **ctx) -> torch.Tensor:
@@ -187,17 +132,11 @@ class Attention(nn.Module):
 		'''
 		Normalizations, projections, and dropouts.
 		'''
-		if self.prenorm is not None:
-			x = self.prenorm(x)
-		
 		atn = self._attention(x, **ctx)
-		atn = self.out_proj(atn)
+		atn = self.c_proj(atn)
 		
 		if self.resid_dropout is not None:
 			atn = self.resid_dropout(atn)
-		
-		if self.postnorm is not None:
-			atn = self.postnorm(atn)
 		
 		output_append(ctx, 'hidden', atn)
 		
@@ -213,22 +152,15 @@ class MultiheadAttention(Attention):
 			heads: int=1,
 			*,
 			max_seq: Optional[int]=None,
-			rotary_embed: Optional[bool|nn.Module]=None,
 			selector: Optional[nn.Module]=None,
 			
-			prenorm: ConfigMod=NORM,
-			dropout: ConfigMod=DROP,
-			postnorm: ConfigMod=None,
-			
-			qknorm: bool|float=True,
-			bias=BIAS
+			dropout: ConfigMod=DROP
 		):
 		'''
 		Parameters:
 			embed: Embedding dimension
 			max_seq: Maximum sequence length
 			
-			rotary_embed: Whether to use rotary embedding, or the embedding module
 			selector: selector module
 			
 			prenorm: Whether to use pre-normalization
@@ -240,29 +172,16 @@ class MultiheadAttention(Attention):
 		'''
 		super().__init__(
 			embed,
-			prenorm=prenorm,
-			dropout=dropout,
-			postnorm=postnorm,
-			bias=bias
+			dropout=dropout
 		)
 		self.heads = heads
-		
-		if isinstance(rotary_embed, bool):
-			self.rotary_embed = RotaryEmbedding(embed) if rotary_embed else None
-		else:
-			self.rotary_embed = rotary_embed
 		
 		if selector is None:
 			assert max_seq is not None, "max_seq must be specified if selector is not"
 			selector = ScaledDotProductSelector(max_seq)
 		self.selector = selector
 		
-		if qknorm: # True or float
-			if qknorm is True:
-				qknorm = embed ** -0.5
-			self.qknorm = nn.Parameter(torch.tensor(qknorm))
-		else: # None or False
-			self.qknorm = None
+		self.scale = embed ** -0.25
 		
 		# Original GPT-2 uses Conv1D from pytorch_util to take advantage of addmm
 		#  which is marginally faster than matmul. This isn't necessary for newer
@@ -271,7 +190,7 @@ class MultiheadAttention(Attention):
 		# Cramming: Training a Language Model on a Single GPU in One Day
 		# https://arxiv.org/abs/2212.14034
 		# * Removing bias has negligible effect on loss and reduces parameters
-		self.qkv_proj = nn.Linear(embed, embed * 3, bias)
+		self.c_attn = nn.Linear(embed, embed * 3)
 	
 	def _split_heads(self, x):
 		x = x.view(*x.shape[:-1], self.heads, -1)
@@ -282,28 +201,9 @@ class MultiheadAttention(Attention):
 		return x.reshape(*x.shape[:-2], self.embed)
 	
 	def _attention(self, x, **ctx):
-		q, k, v = self.qkv_proj(x).chunk(3, dim=-1)
-		
-		if self.rotary_embed is not None:
-			q, k = self.rotary_embed(q, k)
-		
+		q, k, v = self.c_attn(x).chunk(3, dim=-1)
 		q, k, v = map(self._split_heads, (q, k, v))
-		
-		# Query-Key Normalization for Transformers
-		# https://arxiv.org/abs/2010.04245
-		if self.qknorm is not None:
-			q, k = F.normalize(q, dim=-1), F.normalize(k, dim=-1)
-			q, k = q * self.qknorm, k * self.qknorm
-		
-		# Caching for faster inference
-		output = ctx['output']
-		cache = output.get('cache', None)
-		if cache is not None:
-			past_k, past_v = cache
-			k = torch.cat((past_k, k), dim=-2)
-			v = torch.cat((past_v, v), dim=-2)
-			output['cache'] = (k, v)
-		
+		q, k = q * self.scale, k * self.scale
 		x = self.selector(q, k, v, **ctx)
 		return self._merge_heads(x)
 
@@ -314,19 +214,16 @@ class DynamicMemoryQueryAndUpdate(torch.autograd.Function):
 	
 	@staticmethod
 	def forward(ctx, q, k, v, memory):
+		# TODO: Assumes k=1, no weighted sum
 		mk, mv = memory.search(q)
 		memory.update(k, v)
 		return mk, mv
 
 	@staticmethod
 	def backward(ctx, mk_grad, mv_grad):
-		# STE
-		# K'/V' = query, K/V = update
-		# Q ~= K'/K + noise
-		# K'/V' ~= K/V
 		return mk_grad, mk_grad, mv_grad, None
 
-class DynamicMemorySelector(nn.Module):
+class DynamicMemoryAttention(Attention):
 	'''
 	Discretized external memory query-and-update operation. The external memory
 	should approximate attention over an arbitrarily large external memory vector.
@@ -346,27 +243,35 @@ class DynamicMemorySelector(nn.Module):
 	* Read and write/erase heads, paper uses it for memory-augmented tasks
 	'''
 	
-	def __init__(self, selector: Optional[nn.Module]=None):
+	def __init__(self, embed, selector: Optional[nn.Module]=None, dropout=DROP, bias=BIAS):
 		'''
 		Parameters:
 			selector: selector module after memory lookup
 		'''
-		super().__init__()
+		
+		super().__init__(
+			embed,
+			dropout=dropout,
+			bias=bias
+		)
+		self.qkv_proj = nn.Linear(embed, embed, bias)
 		self.selector = default(selector, lambda: ScaledDotProductSelector())
 	
-	def forward(self, q, k, v, **ctx):
+	def _attention(self, x, **ctx):
 		output_append(ctx, 'attention', None)
-		k, v = DynamicMemoryQueryAndUpdate.apply(q, k, v, ctx['dynamic_memory'])
+		q, k, v = self.qkv_proj(x)
+		k, v = DynamicMemoryQueryAndUpdate.apply(q, k, v, ctx['static_memory'])
 		return self.selector(q, k, v, **ctx)
 
 class StaticMemoryQuery(torch.autograd.Function):
 	'''
-	Core autograd function for StaticMemorySelector.
+	Core autograd function for StaticMemoryAttention.
 	'''
+	
 	@staticmethod
 	def forward(ctx, q, memory):
 		# Approximate Nearest Neighbor
-		ann = memory.search(q)
+		ann = memory.search(q).to(q.device)
 
 		# Compute the dot product similarity and softmax
 		sim = torch.einsum('bsd,bskd->bsk', q, ann)
@@ -381,6 +286,7 @@ class StaticMemoryQuery(torch.autograd.Function):
 	
 	@staticmethod
 	def backward(ctx, grad_wsum):
+		# Not 100% sure this is the right gradient for softmax and weighted sum
 		ann, weight = ctx.saved_tensors
 		
 		grad_weight = torch.einsum('bsd,bskd->bsk', grad_wsum, ann)
@@ -421,10 +327,7 @@ class StaticMemoryAttention(Attention):
 	def __init__(self,
 			embed: int,
 			*,
-			prenorm: ConfigMod=NORM,
 			dropout: ConfigMod=DROP,
-			postnorm: ConfigMod=None,
-			
 			bias=BIAS
 		):
 		'''
@@ -439,10 +342,7 @@ class StaticMemoryAttention(Attention):
 		'''
 		super().__init__(
 			embed,
-			prenorm=prenorm,
-			dropout=dropout,
-			postnorm=postnorm,
-			bias=bias
+			dropout=dropout
 		)
 		self.query_proj = nn.Linear(embed, embed, bias)
 	
@@ -461,43 +361,15 @@ class Residual(nn.ModuleList):
 			x = x + layer(x, **ctx)
 		return x
 
-class Instill(Residual):
-	'''
-	INformation Still. Information goes up and comes back down condensed and
-	distilled. This is a generalization of the residual connection.
-	
-	Adds residual of upper layers to lower layers as feedback.
-	
-	Addressing Some Limitations of Transformers with Feedback Memory
-	https://arxiv.org/abs/2002.09402
-	* Using output of upper layers for lower (modified: per layer pair, no pooling)
-	
-	Memory transformers
-	https://arxiv.org/abs/2006.11527
-	* Concatenating memory to input tokens (modified: no memory controller)
-	'''
-	
-	def _feedback(self, x, f, **ctx):
-		'''How to apply the feedback'''
-		return x if f is None else x + f
-	
-	def forward(self, x, **ctx):
-		f = ctx.get('feedback', None)
-		if f is None:
-			f = [None] * len(self)
-		
-		for i, layer in enumerate(self):
-			print("Layer", i)
-			x = x + layer(self._feedback(x, f[i], **ctx), **ctx)
-		return x
-
 class LanguageModel(nn.Module):
 	'''
 	Wraps a language model with a token embedding and a linear output layer.
 	'''
+	
 	def __init__(self,
 			vocab: int,
 			embed: int,
+			max_seq: int,
 			model: list[nn.Module],
 			dropout: Optional[nn.Module]=None,
 			postnorm: Optional[nn.Module]=None,
@@ -514,25 +386,33 @@ class LanguageModel(nn.Module):
 		'''
 		super().__init__()
 		
-		self.embed = nn.Embedding(vocab, embed)
-		self.embed_dropout = dropout
-		self.lm = model
-		self.postnorm = postnorm
-		self.lm_head = nn.Linear(vocab, embed, bias=BIAS)
-		self.lm_head.weight = self.embed.weight
+		self.wte = nn.Embedding(vocab, embed)
+		self.wpe = nn.Embedding(max_seq, embed)
+		self.drop = dropout
+		self.transformer = model
+		self.ln_f = postnorm
+		# Tie lm_head and embed weights
+		self.lm_head = nn.Linear(vocab, embed, bias=False)
+		self.lm_head.weight = self.wte.weight
 		self.dtype = default(dtype, torch.float32)
+	
+	def embed(self, x, positional=True):
+		x = self.wte(x)
+		if positional:
+			pos = torch.arange(0, x.shape[-1], device=x.device)
+			pos = pos.unsqueeze(0).view(-1, x.shape[-1])
+			print("EMBED", x.shape, pos.shape)
+			x = x + self.wpe(pos)
+		return x
 	
 	def forward(self,
 			x: torch.Tensor,
 			*,
 			static_memory: Optional[object]=None,
 			dynamic_memory: Optional[object]=None,
-			feedback: Optional[list[torch.Tensor]]=None,
-			cache: Optional[tuple[torch.Tensor, torch.Tensor]]=None,
 			
 			# Masks
 			attention_mask: Optional[torch.Tensor]=None,
-			head_mask: Optional[torch.Tensor]=None,
 			
 			# Flags
 			output_attention=False,
@@ -540,16 +420,15 @@ class LanguageModel(nn.Module):
 		) -> tuple:
 		'''
 		kwargs:
-			x: Input embeddings (NOT ids)
-			feedback: Feedback from previous timestep
-			cache: key and value for past attention
+			x: Input embeddings or ids
+			static_memory: Static memory
+			dynamic_memory: Dynamic memory
 			
 			attention_mask: Mask for attention
 			head_mask: Mask for attention heads
 			
 			output_attention: Output attention
 			output_hidden: Output hidden states
-			use_cache: Use cache for attention
 		'''
 		
 		# Convert ids to embedding
@@ -565,24 +444,18 @@ class LanguageModel(nn.Module):
 			attention_mask = attention_mask.to(dtype=self.dtype)  # fp16 compatibility
 			attention_mask = (1.0 - attention_mask) * torch.finfo(self.dtype).min
 		
-		if self.embed_dropout is not None:
-			x = self.embed_dropout(x)
+		if self.drop is not None:
+			x = self.drop(x)
 		
 		output = {
-			"cache": [] if cache is not None else None,
 			"hidden": [] if output_hidden else None,
 			"attention": [] if output_attention else None
 		}
 		
-		self.lm(x,
+		self.transformer(x,
 		 	dynamic_memory=dynamic_memory,
 			static_memory=static_memory,
-			feedback=feedback,
-			cache=cache,
-			
 			attention_mask=attention_mask,
-			head_mask=head_mask,
-			
 		 	output=output
 		)
 		
@@ -590,25 +463,31 @@ class LanguageModel(nn.Module):
 			output['hidden'].append(x)
 		
 		# Process final hidden state
-		if self.postnorm is not None:
-			x = self.postnorm(x)
+		if self.ln_f is not None:
+			x = self.ln_f(x)
+		
+		x = self.lm_head(x)
 		
 		return x, output
 
-class MyModelBlock(nn.Module):
-	def __init__(self, attn, smem):
+class DMTransformerBlock(nn.Module):
+	def __init__(self, embed, eps, attn, smem):
 		super().__init__()
+		self.ln_1 = nn.LayerNorm(embed, eps)
 		self.attn = attn
+		self.ln_2 = nn.LayerNorm(embed, eps)
 		self.smem = smem
 	
 	def forward(self, x, **ctx):
+		x = self.ln_1(x)
 		x = self.attn(x, **ctx)
+		x = self.ln_2(x)
 		x = self.smem(x, **ctx)
 		return x
 
-class MyModel(Instill):
+class DMTransformer(nn.Module):
 	'''
-	Model designed to load GPT-2 weights
+	Discrete Memory Transformer model designed to load GPT-2 weights
 	'''
 	
 	def __init__(self,
@@ -620,11 +499,9 @@ class MyModel(Instill):
 			# Norms
 			norm_epsilon: Optional[float]=NORM,
 			prenorm_epsilon: Optional[float]=None,
-			postnorm_epsilon: Optional[float]=None,
 			
 			# Dropout
 			dropout_p: Optional[float]=DROP,
-			pdrop_residual: Optional[float]=None,
 			pdrop_attn: Optional[float]=None
 		):
 		'''
@@ -642,42 +519,38 @@ class MyModel(Instill):
 			pdrop_residual - Residual dropout rate
 			pdrop_attn - Attention dropout rate
 		'''
+		super().__init__()
 		
 		prenorm_epsilon = default(prenorm_epsilon, norm_epsilon)
-		postnorm_epsilon = default(postnorm_epsilon, norm_epsilon)
-		
-		pdrop_residual = default(pdrop_residual, dropout_p) or None
 		pdrop_attn = default(pdrop_attn, dropout_p) or None
-		
-		def prenorm_dropout():
-			return {
-				"prenorm": nn.LayerNorm(embed, prenorm_epsilon),
-				"dropout": nn.Dropout(pdrop_residual)
-			}
 		
 		# Note to self: if we want this to succeed as a proof of concept, we
 		#  can't be too experimental with the setup. It needs to be roughly
 		#  1:1 with the teacher model, even if that doesn't make complete
 		#  sense. Here, MHA/SMA relates directly to GPT-2 MHA/MLP
-		def block(rot=False):
-			return MyModelBlock(
+		def block():
+			return DMTransformerBlock(
+				embed, prenorm_epsilon,
 				MultiheadAttention(embed, heads,
-					rotary_embed=rot,
 					selector=ScaledDotProductSelector(
 						max_seq, dropout=pdrop_attn
-					),
-					**prenorm_dropout()
+					)
 				),
-				StaticMemoryAttention(embed, **prenorm_dropout())
+				StaticMemoryAttention(embed)
 			)
 		
-		super().__init__([
-			block(True), *(block() for i in range(1, layers))
+		self.h = Residual([
+			block() for i in range(1, layers)
 		])
+	
+	def forward(self, x, **ctx):
+		for layer in self.h:
+			x = layer(x, **ctx)
+		return x
 
-class MyGPT2Model(MyModel):
+class DMGPT2Model(DMTransformer):
 	'''
-	MyModel configured using GPT-2 parameters.
+	DMTransformer configured using GPT-2 parameters.
 	'''
 	
 	def __init__(self, config: GPT2Config):
@@ -707,11 +580,9 @@ class MyGPT2Model(MyModel):
 			max_seq=config.n_positions,
 			
 			dropout_p=config.resid_pdrop,
-			pdrop_residual=config.resid_pdrop,
 			pdrop_attn=config.attn_pdrop,
 			
 			prenorm_epsilon=config.layer_norm_epsilon,
-			postnorm_epsilon=config.layer_norm_epsilon
 		)
 
 class TransformersWrapper(nn.Module):
