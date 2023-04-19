@@ -1,0 +1,6 @@
+torch
+numpy
+faiss
+lightning
+transformers
+datasets
