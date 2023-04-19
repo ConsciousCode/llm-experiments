@@ -222,24 +222,24 @@ I'm unsure how to rectify imagination, if it's even a problem for larger models.
 # TODO
 
 1. Set up dynamic memory (requires DB library)
-  - Write DB code to use a generic SQL interface so sqlite or an IPC daemon can be used
-  - Move key pruning to DB code
-  - Database eviction (LFRU, similar key recombinations, etc.)
+   * Write DB code to use a generic SQL interface so sqlite or an IPC daemon can be used
+   * Move key pruning to DB code
+   * Database eviction (LFRU, similar key recombinations, etc.)
 2. Clean up code to make testing alternative architectures easier
-  - Write code to test alternative architectures
-  - Set up knowledge distillation
+   * Write code to test alternative architectures
+   * Set up knowledge distillation
 3. Write code to abstract language models, allowing for asynchronous interfaces
-  - Logging all LLM interactions
+   - Logging all LLM interactions
 5. Chat interface
-  - "Mindset" program, view the database and interact with the language model
+   * "Mindset" program, view the database and interact with the language model
 6. Cognitive architecture
-  - "Dialog Tree" immutable class abstraction to ground complex interactions
-  - Conversation summarization and memory
-  - Explicit memory querying
-  - Task priority queues (with LLM determining priority)
-  - Inner dialogue / feedback loops
-  - Emotion feedback loop, possibly annotate memories with arousal and valence
-  - Generative Agent techniques
-    * Memory annotation with recency, importance, and relevance (and saliency?)
-    * Reflection on the previous 100 memories by generating 3 most salient questions and then answering them with reasoning and citation
-    * Tool integration (Google, Python REPL, file I/O, etc.)
+   * "Dialog Tree" immutable class abstraction to ground complex interactions
+   * Conversation summarization and memory
+   * Explicit memory querying
+   * Task priority queues (with LLM determining priority)
+   * Inner dialogue / feedback loops
+   * Emotion feedback loop, possibly annotate memories with arousal and valence
+   * Generative Agent techniques
+     - Memory annotation with recency, importance, and relevance (and saliency?)
+     - Reflection on the previous 100 memories by generating 3 most salient questions and then answering them with reasoning and citation
+     - Tool integration (Google, Python REPL, file I/O, etc.)
