@@ -1,0 +1,39 @@
+CREATE TABLE IF NOT EXISTS meta (
+	version INTEGER NOT NULL
+);
+INSERT OR IGNORE INTO meta (version, name) VALUES (0);
+
+-- Metadata for vector databases
+CREATE TABLE IF NOT EXISTS vector_master (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	name TEXT NOT NULL,
+	engine TEXT,
+	dim INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS embed_text (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	FOREIGN KEY(embed_id) REFERENCES embed_meta(id),
+	value TEXT NOT NULL
+);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS embeddings USING vss0 (
+	embedding(1536) factory="IVF4096,Flat,IDMap2",
+);
+
+CREATE TABLE IF NOT EXISTS embeds (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	url TEXT NOT NULL,
+	title TEXT NOT NULL,
+	description TEXT NOT NULL,
+	image TEXT NOT NULL,
+	author TEXT NOT NULL,
+	author_url TEXT NOT NULL,
+	provider TEXT NOT NULL,
+	provider_url TEXT NOT NULL,
+	type TEXT NOT NULL,
+	width INTEGER NOT NULL,
+	height INTEGER NOT NULL,
+	html TEXT NOT NULL,
+	created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);

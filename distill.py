@@ -88,8 +88,9 @@ for tk, tw in teacher.state_dict().items():
 	if 'proj' in sk and len(tw.shape) > 1:
 		tw = tw.T
 	student_state[sk] = tw
-
-print("Unused keys:", unused | (set(teacher.state_dict().keys()) - set(student_state.keys())))
+unused |= set(teacher.state_dict().keys()) - set(student_state.keys())
+unused = set(x for x in unused if "mlp" not in x)
+print("Unused keys:", unused)
 
 student.load_state_dict(student_state, strict=False)
 

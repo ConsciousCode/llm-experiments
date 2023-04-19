@@ -348,7 +348,7 @@ class StaticMemoryAttention(Attention):
 	
 	def _attention(self, x, **ctx):
 		output_append(ctx, 'attention', None)
-		q = self.query_proj(x)
+		q = F.normalize(self.query_proj(x), dim=-1)
 		return StaticMemoryQuery.apply(q, ctx['static_memory'])
 
 class Residual(nn.ModuleList):

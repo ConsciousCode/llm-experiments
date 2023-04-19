@@ -5,3 +5,4 @@ faiss-gpu
 lightning
 transformers
 datasets
+tensorboard

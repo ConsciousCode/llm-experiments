@@ -19,6 +19,12 @@ def torch_cast(x: np.ndarray) -> torch.Tensor:
 	'''
 	return torch.from_numpy(x)
 
+def is_normalized(x: np.ndarray) -> bool:
+	'''
+	Checks if the input is normalized.
+	'''
+	return np.allclose(np.linalg.norm(x, axis=-1), 1)
+
 class Index(ABC):
 	'''
 	One-way map from keys (via nearest neighbor) to indices.
@@ -172,6 +178,9 @@ class PickleStore(Store):
 	def set(self, idx, v):
 		# idx: (batch,)
 		# v: (batch, dim)
+		if idx.size == 0:
+			return
+		
 		for x, i in enumerate(np.nditer(idx)):
 			self.store[i.item()] = v[x]
 	
@@ -186,25 +195,32 @@ class Database:
 	Everything else in this file uses numpy.
 	'''
 	
-	def __init__(self, index, store, training=True):
+	def __init__(self, index, store, training=True, pressure=0.5):
 		self.index = index
 		self.store = store
 		self.training = training
+		self.pressure = pressure
 	
 	def add(self, k, v):
+		k, v = numpy_cast(k), numpy_cast(v)
 		k = k.reshape(-1, k.shape[-1])
-		k = numpy_cast(k)
-		
 		v = v.reshape(-1, v.shape[-1])
-		v = numpy_cast(v)
+		assert is_normalized(k), "Key vectors must be normalized"
+		assert is_normalized(v), "Value vectors must be normalized"
+		
+		*seq, dim = k.shape
+		print("Adding", k.size // dim, "keys")
 		
 		i = self.index.add(k)
 		self.store.set(i, v)
+		
+		print("Total", len(self.index))
 	
 	def search(self, q):
 		batch, seq, dim = q.shape
-		q = q.reshape(-1, dim)
 		q = numpy_cast(q)
+		q = q.reshape(-1, q.shape[-1])
+		assert is_normalized(q), f"Query vectors must be normalized"
 		
 		# Edge case for when the index is empty
 		can_add = True
@@ -214,6 +230,10 @@ class Database:
 		
 		d, i = self.index.search(q)
 		if self.training and can_add:
+			print("distances", d)
+			print("any positive?", np.any(d > 0))
+			q = q[np.where(-d > self.pressure)[0],:]
+			print("new", q.shape)
 			self.add(q, q)
 		return torch_cast(self.store.get(i).reshape(batch, seq, -1, dim))
 	
