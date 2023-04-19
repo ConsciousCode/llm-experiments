@@ -1,6 +1,7 @@
 torch
 numpy
-faiss
+faiss-cpu
+faiss-gpu
 lightning
 transformers
 datasets

@@ -47,9 +47,6 @@ torch.set_float32_matmul_precision('medium')
 pl.seed_everything(42)
 
 def map_gpt2_to_mine(teacher):
-	if 'wpe' in teacher:
-		return None
-	
 	student = (teacher
 		.replace("transformer.", "lm.")
 		.replace(".c_attn.", ".attn.qkv_proj.")
@@ -82,14 +79,17 @@ memory = knn.TestDatabase(config.n_embd, "test.db")
 print("Transfer weights")
 
 student_state = OrderedDict()
-
+unused = set()
 for tk, tw in teacher.state_dict().items():
 	sk = map_gpt2_to_mine(tk)
 	if sk is None:
+		unused.add(tk)
 		continue
 	if 'proj' in sk and len(tw.shape) > 1:
 		tw = tw.T
 	student_state[sk] = tw
+
+print("Unused keys:", unused | (set(teacher.state_dict().keys()) - set(student_state.keys())))
 
 student.load_state_dict(student_state, strict=False)
 
@@ -117,14 +117,9 @@ class KnowledgeDistillationModel(pl.LightningModule):
 		input_ids, attention_mask = batch
 		input_ids = input_ids.reshape(self.batch_size, self.max_length)
 		attention_mask = attention_mask.reshape(self.batch_size, self.max_length)
-		labels = student.embed(input_ids, positional=False)
 		
-		print("input", type(input_ids), input_ids)
 		#input_ids = torch.stack(input_ids, dim=0)
 		#attention_mask = torch.stack(attention_mask, dim=0)
-
-		print("input_ids shape:", input_ids.shape, "type:", input_ids.dtype)
-		print("attention_mask shape:", attention_mask.shape, "type:", attention_mask.dtype)
 		
 		# Teacher model output
 		with torch.no_grad():
@@ -140,24 +135,25 @@ class KnowledgeDistillationModel(pl.LightningModule):
 			static_memory=self.memory
 		)
 		
-		print("shape", input_ids.shape, teacher_logits.shape, student_logits.shape)
-
 		# Calculate distillation loss
 		distill_loss = self.distill_loss(
 			F.log_softmax(student_logits / self.temperature, dim=-1),
 			F.softmax(teacher_logits / self.temperature, dim=-1)
 		)
-		student_loss = self.ce_loss(student_logits, labels)
-		teacher_loss = self.ce_loss(teacher_logits, labels)
+		student_logits = student_logits.view(-1, student_logits.shape[-1])
+		teacher_logits = teacher_logits.view(-1, teacher_logits.shape[-1])
+		input_ids = input_ids.view(-1)
+		
+		student_loss = self.ce_loss(student_logits, input_ids)
+		teacher_loss = self.ce_loss(teacher_logits, input_ids)
 		
 		loss = distill_loss + student_loss
 		
-		self.log("train_loss", {
-			"combined": loss,
-			"distill": distill_loss,
-			"ce_teacher": teacher_loss,
-			"ce_student": student_loss
-		})
+		self.log("train_loss/combined", loss)
+		self.log("train_loss/distill", distill_loss)
+		self.log("train_loss/ce_teacher", teacher_loss)
+		self.log("train_loss/ce_student", student_loss)
+		
 		return loss
 
 	def configure_optimizers(self):

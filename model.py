@@ -399,9 +399,8 @@ class LanguageModel(nn.Module):
 	def embed(self, x, positional=True):
 		x = self.wte(x)
 		if positional:
-			pos = torch.arange(0, x.shape[-1], device=x.device)
-			pos = pos.unsqueeze(0).view(-1, x.shape[-1])
-			print("EMBED", x.shape, pos.shape)
+			pos = torch.arange(0, x.shape[1], device=x.device)
+			pos = pos.unsqueeze(0)
 			x = x + self.wpe(pos)
 		return x
 	
