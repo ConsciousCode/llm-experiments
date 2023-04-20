@@ -12,7 +12,7 @@ def main():
 	
 	while True:
 		msg = input(f"{name}: ")
-		print(f"{agent.name}: {agent.chat(name, msg)}")
+		print(agent.chat(name, msg))
 
 if __name__ == '__main__':
 	main()

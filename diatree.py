@@ -26,7 +26,7 @@ class Diatree:
 		self.children = children
 	
 	def __str__(self): return ''.join(self.children)
-	def __repr__(self): return f'Diatree{super().__repr__()}'
+	def __repr__(self): return f'Diatree{self.children!r}'
 	def __iter__(self): return iter(self.children)
 	def __len__(self): return len(self.children)
 	def __add__(self, other):
@@ -36,8 +36,8 @@ class Diatree:
 	
 	def __getitem__(self, x: int|slice):
 		if isinstance(x, slice):
-			return Diatree(*super().__getitem__(x))
-		return super().__getitem__(x)
+			return Diatree(*self.children[x])
+		return self.children[x]
 	
 	def alter(self, x: int|range, *elems):
 		'''
