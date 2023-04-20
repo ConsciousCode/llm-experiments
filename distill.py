@@ -72,6 +72,16 @@ student = model.DMGPT2Model(config)
 student = model.LanguageModel(config.vocab_size, config.n_embd, config.n_positions, student)
 #print(student)
 #exit()
+from db import Database
+from db.faiss import FaissIndex
+from db.pickle import PickleStore
+class TestDatabase(Database):
+	'''
+	Proof of concept database.
+	'''
+	
+	def __init__(self, dim, path):
+		super().__init__(FaissIndex(dim, path + ".index"), PickleStore(dim, path + ".store"))
 memory = knn.TestDatabase(config.n_embd, "test.db")
 
 #print("Config:", config)

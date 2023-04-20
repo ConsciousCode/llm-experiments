@@ -239,7 +239,7 @@ I'm unsure how to rectify imagination, if it's even a problem for larger models.
    * Task priority queues (with LLM determining priority)
    * Inner dialogue / feedback loops
    * Emotion feedback loop, possibly annotate memories with arousal and valence
-   * Generative Agent techniques
+   * Generative Agent techniques*
      - Memory annotation with recency, importance, and relevance (and saliency?)
      - Reflection on the previous 100 memories by generating 3 most salient questions and then answering them with reasoning and citation
      - Tool integration (Google, Python REPL, file I/O, etc.)

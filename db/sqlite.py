@@ -21,35 +21,9 @@ class EmbedTable:
 	schema: Optional[tuple[str]]
 	data_cache: Optional[list[tuple]]
 	vector_cache: faiss.IndexFlatIP
-	lastrowid: int
+	lastrowid: Optional[int]
 
-@dataclass
-class TopK:
-	'''
-	Top-K results, allows for both SoA and AoS access
-	'''
-	k: int
-	distance: np.ndarray
-	vector: np.ndarray
-	idx: np.ndarray
-	
-	class Index(NamedTuple):
-		'''SoA access to a single result'''
-		distance: float
-		vector: np.ndarray
-		idx: int
-	
-	def __iter__(self): return iter(self.idx)
-	def __len__(self): return self.k
-	def __getitem__(self, i):
-		return TopK.Index(self.distance[i], self.vector[i], self.idx[i])
-
-def sanitize_name(name):
-	if not name.isidentifier():
-		raise ValueError(f"Invalid table name {name!r}")
-	return name.lower()
-
-class Database:
+class SqliteDatabase:
 	'''
 	Wrapper class around sqlite and sqlite_vss which adds faiss indexing.
 	This adds a layer of caching to the database, which is flushed to the

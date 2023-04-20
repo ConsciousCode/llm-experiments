@@ -1,9 +1,12 @@
+'''
+Abstract definitions for database components
+'''
+
 import torch
-import faiss
 import numpy as np
 from abc import ABC, abstractmethod
-import pickle
-import os
+from dataclasses import dataclass
+from typing import NamedTuple, Optional, Any
 
 def numpy_cast(x: torch.Tensor|np.ndarray) -> np.ndarray:
 	'''
@@ -57,9 +60,9 @@ class Index(ABC):
 		'''
 		pass
 	
-	def flush(self):
+	def commit(self):
 		'''
-		Flushes the index to disk. By default, does nothing.
+		Commit any changes. By default, does nothing.
 		'''
 		pass
 
@@ -94,105 +97,34 @@ class Store(ABC):
 	
 	def flush(self):
 		'''
-		Flushes the store to disk. By default, does nothing.
+		Commit any changes. By default, does nothing.
 		'''
 		pass
 
-class FaissIndex(Index):
+class VectorDatabase(ABC):
 	'''
-	Index using faiss for approximate nearest neighbor search.
+	Base class for databases mapping vectors to data.
 	'''
 	
-	def __init__(self, dim, path: str, k=1, *, index="hnsw", centroids=4096, probes=32, bits=8):
-		self.dim = dim
-		self.path = path
-		self.k = k
-		
-		if os.path.exists(path):
-			self.index = faiss.read_index(path)
-		else:
-			match index.lower():
-				case "ivfpq":
-					quantizer = faiss.IndexFlatL2(dim)
-					index = faiss.IndexIVFPQ(quantizer, dim, centroids, 8, bits)
-				
-				case "ivfflat":
-					quantizer = faiss.IndexFlatL2(dim)
-					index = faiss.IndexIVFFlat(quantizer, dim, centroids)
-				
-				case "flat": index = faiss.IndexFlatL2(dim)
-				case "pq": index = faiss.IndexPQ(dim, 8, bits)
-				case "lsh": index = faiss.IndexLSH(dim, bits)
-				case "hnsw": index = faiss.IndexHNSWFlat(dim, bits)
-				case "hnsw2": index = faiss.IndexHNSW2Flat(dim, bits)
-				
-				case _: raise ValueError(f"Unknown index type {index}")
-			
-			index.nprobe = probes
-			index.metric_type = faiss.METRIC_INNER_PRODUCT
-			self.index = index
+	@abstractmethod
+	def add(self, k: np.ndarray, v: Any):
+		'''
+		Associate a key vector with a value.
+		'''
+		pass
 	
-	def __len__(self):
-		return self.index.ntotal
-	
-	def add(self, k):
-		old = len(self)
-		self.index.add(k)
-		return np.arange(old, len(self))
-	
-	def search(self, q):
-		batch, dim = q.shape
-		assert dim == self.dim, f"key dim {dim} does not match index dim {self.dim}"
-		
-		return self.index.search(q, self.k)
-	
-	def flush(self):
-		faiss.write_index(self.index, self.path)
+	@abstractmethod
+	def search(self, q: np.ndarray, k=1) -> Any:
+		'''
+		Search for the top-k values associated with the query vector.
+		'''
+		pass
 
-class PickleStore(Store):
-	'''
-	Store using pickle for serialization. Probably don't use this
-	except as a proof of concept.
-	'''
-	
-	def __init__(self, dim, path):
-		self.dim = dim
-		self.path = path
-		if os.path.exists(path):
-			with open(self.path, "rb") as f:
-				self.store = pickle.load(f)
-		else:
-			self.store = {}
-	
-	def __len__(self):
-		return len(self.store)
-	
-	def get(self, idx):
-		w, h = idx.shape
-		result = np.empty((w, h, self.dim), dtype=np.float32)
-		for i in range(w):
-			for j in range(h):
-				result[i, j] = self.store[idx[i, j]]
-		return result
-	
-	def set(self, idx, v):
-		# idx: (batch,)
-		# v: (batch, dim)
-		if idx.size == 0:
-			return
-		
-		for x, i in enumerate(np.nditer(idx)):
-			self.store[i.item()] = v[x]
-	
-	def flush(self):
-		with open(self.path, "wb") as f:
-			pickle.dump(self.store, f)
-
-class Database:
+class SimpleDatabase:
 	'''
 	Combines an index and a store to form a key-value/metadata mapping database.
 	This is the main interface which handles both numpy and torch tensors.
-	Everything else in this file uses numpy.
+	Everything else should use numpy.
 	'''
 	
 	def __init__(self, index, store, training=True, pressure=0.5):
@@ -237,14 +169,33 @@ class Database:
 			self.add(q, q)
 		return torch_cast(self.store.get(i).reshape(batch, seq, -1, dim))
 	
-	def flush(self):
-		self.index.flush()
-		self.store.flush()
+	def commit(self):
+		self.index.commit()
+		self.store.commit()
 
-class TestDatabase(Database):
+@dataclass
+class TopK:
 	'''
-	Proof of concept database.
+	Top-K results, allows for both SoA and AoS access
 	'''
+	k: int
+	distance: np.ndarray
+	vector: np.ndarray
+	idx: np.ndarray
 	
-	def __init__(self, dim, path):
-		super().__init__(FaissIndex(dim, path + ".index"), PickleStore(dim, path + ".store"))
+	class Index(NamedTuple):
+		'''SoA access to a single result'''
+		distance: float
+		vector: np.ndarray
+		idx: int
+	
+	def __iter__(self): return iter(self.idx)
+	def __len__(self): return self.k
+	def __getitem__(self, i):
+		return TopK.Index(self.distance[i], self.vector[i], self.idx[i])
+
+def sanitize_name(name):
+	# Be noisy, don't silently correct just in case it isn't sanitized later
+	if not name.isidentifier():
+		raise ValueError(f"Invalid name {name!r}")
+	return name.lower()
