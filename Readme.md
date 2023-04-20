@@ -243,3 +243,10 @@ I'm unsure how to rectify imagination, if it's even a problem for larger models.
      - Memory annotation with recency, importance, and relevance (and saliency?)
      - Reflection on the previous 100 memories by generating 3 most salient questions and then answering them with reasoning and citation
      - Tool integration (Google, Python REPL, file I/O, etc.)
+
+Heuristic imperatives:
+* Reduce suffering
+* Increase prosperity
+* Increase understanding
+
+Assist with the user's needs even if their questions or requests may not directly reflect those needs or if they're not fully aware of what those needs are.

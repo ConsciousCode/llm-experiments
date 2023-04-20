@@ -28,7 +28,7 @@ def is_normalized(x: np.ndarray) -> bool:
 	'''
 	return np.allclose(np.linalg.norm(x, axis=-1), 1)
 
-class Index(ABC):
+class VectorIndex(ABC):
 	'''
 	One-way map from keys (via nearest neighbor) to indices.
 	'''
@@ -66,7 +66,7 @@ class Index(ABC):
 		'''
 		pass
 
-class Store(ABC):
+class VectorStore(ABC):
 	'''
 	Stores values at indices.
 	'''
@@ -95,7 +95,7 @@ class Store(ABC):
 		'''
 		pass
 	
-	def flush(self):
+	def commit(self):
 		'''
 		Commit any changes. By default, does nothing.
 		'''
@@ -117,6 +117,12 @@ class VectorDatabase(ABC):
 	def search(self, q: np.ndarray, k=1) -> Any:
 		'''
 		Search for the top-k values associated with the query vector.
+		'''
+		pass
+	
+	def commit(self):
+		'''
+		Commit any changes. By default, does nothing.
 		'''
 		pass
 
