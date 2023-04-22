@@ -13,7 +13,7 @@ $ python distill.py
 ```
 
 To test the cognitive architecture, probably change `complete = ...` in `agent.py` to `complete_chatgpt` and run
-
+4
 ```bash
 $ python chat.py
 ```
@@ -29,6 +29,7 @@ Nothing fancy right now, a barebones proof of concept for my discrete memory tra
 You'll also want to run Tensorboard to view pretty graphs of the loss over time. Run `tensorboard --logdir lightning_logs/` and then navigate to `localhost:6006` in your browser. At first, you won't see the training loss - open the dropdown at the bottom labeled "train_loss".
 
 [Attention Is All You Need](https://arxiv.org/abs/1706.03762)
+
 [GPT-4 understands cuil theory](https://pastebin.com/LTbD5WYT)
 
 # Ideas
@@ -45,18 +46,24 @@ The actual implementation doesn't matter as long as:
 2. It has some notion of distance between keys (which can be approximate)
 3. It supports inserting a relatively large number of keys per time step, `(batch * heads * layers)`
 
-I based the formal model on the Neural Turing Machine, which has "read" and "write"/"erase" heads. Unlike NTMs, an external memory is not differentiable, but Straight-Through Estimate (STE) can be used to approximate the gradient with `dQuery = dKeyReturned`, `dKeyInserted = dKeyReturned`, and `dValueInserted = dValueReturned`, based on the observation that `KeyReturned ≈ Query + noise`. I haven't found a way to incorporate the erase operation as it's completely non-differentiable since it has no return and there's no clear objective which could approximate it. Thus database size has to use external methods to prune, either through LRFU eviction or recombination of keys and values when they appear in a top-k query (something most vector databases wouldn't readily support).
+I based the formal model on the Neural Turing Machine, which has "read" and "write"/"erase" heads. Unlike NTMs, an external memory is not differentiable, but Straight-Through Estimate (STE) can be used to approximate the gradient with `dQuery = dKeyReturned`, `dKeyInserted = dKeyReturned`, and `dValueInserted = dValueReturned`, based on the observation that `KeyReturned ≈ Query + noise`. I haven't found a way to incorporate an erase operation as it's completely non-differentiable since it has no return and there's no clear objective which could approximate it. Thus database size has to use external methods to prune, either through LRFU eviction or recombination of keys and values when they appear in a top-k query (something most vector databases wouldn't readily support).
 
-The current iteration of the idea has these steps:
-1. Compute attention weights as normal
-2. Select the largest attention weights and their corresponding queries, keys, and values
-  * Currently using `max()`, one for each head to dramatically reduce the numbers
-3. Perform the query-and-update operation with the external memory
-4. Compute memory attention as softmax(Q K'^T)V', with Q being the queries and K' and V' being the keys and values returned from the memory
-5. Add the self and memory attentions together
-  * This is equivalent to concatenating the keys and values and computing attention, but we already computed the normal attention
- 
-It's worth noting that hobbyists have already started playing with this idea using Pinecone, mostly by creating embeddings for document fragments and questions, querying kNN, and dumping the document fragments into the LLM's context window. This is a good start, but it limits the model's ability to incorporate the information as well as the size of its context window, since it means a large portion is taken up by the documents (and those tokens are also expensive).
+The current iteration of the idea has two layer types with different strenghts. Featural memory uses top-k embeddings with the queries to produce the output, while associative memory does the full query-key-value projection, queries top-k to the keys, inserts keys and values if the top-k distances are far enough, and then computes the attention with the returned keys and values. The featural memory is more efficient and has a smaller memory footprint, but the associative memory is more expressive and can be used to implement the featural memory. In particular, I expect featural memory to be more useful to lower-level syntactic features of the early transformer layers, while associative memory will be more useful to higher-level semantic features of the later transformer layers.
+
+Featural memory steps:
+1. Compute query projection
+2. Retrieve top-k query embeddings
+3. Weighted sum the top-k values using distance
+4. Output projection
+
+Associative memory steps:
+1. Compute query, key, and value projections
+2. Retrieve top-k keys
+3. If the top-k distances are large enough, insert the corresponding keys and their values
+4. Compute attention with the returned keys and values and the originaly queries
+5. Output projection
+
+It's worth noting that hobbyists have already started playing with related ideas using Pinecone, mostly by creating embeddings for document fragments and questions, querying kNN, and dumping the document fragments into the LLM's context window. This is a good start, but it limits the model's ability to incorporate the information as well as the size of its context window, since it means a large portion is taken up by the documents (and those tokens are also expensive).
 
 * [Transformer Feed-Forward Layers Are Key-Value Memories](https://arxiv.org/abs/2012.14913)
 * [Augmenting Self-attention with Persistent Memory](https://arxiv.org/pdf/1907.01470.pdf)
@@ -130,17 +137,13 @@ A language could be developed which formalizes prompt engineering in a way which
 
 ## Curiosities
 
-### [THINK] token
-Chain of Thought can be integrated explicitly into the model by giving it an extra `[THINK]` token which corresponds to a kind of code-switching to the model thinking private thoughts not ordinarily visible to the user. This would give it the opportunity to think about what it's doing, since right now it has to generate text on the fly. It also allows for better explicability and debugging, since the model's inner thoughts can be directly viewed. This is already being done to some extent through proper prompt engineering, eg by giving the model a few-shot example in which it's made to give a thought about what it's doing, but it's not as direct as having a dedicated token.
-
-### [IDLE] token
-Run the model continuously, with an output of [IDLE] indicating that it doesn't want to say anything that time step. This could potentially open the way for it to break out of all output being a direct response to a user. More research is needed into the multi-modal models which must have some mechanism for decoupling language model timesteps from actions taken by their embodiments.
-
 ### Prompt injection mitigations
-There are a few techniques I've thought of to mitigate prompt injections, though the larger models seem to have much less trouble with this. One would be to have an explicit `[PROMPT]` token like above, but this could be forgotten (especially if the model is still limited to the context window). A more promising option is label-conditioning, including a binary `[-1, 1]` label indicating whether text is a prompt or content.
+There are a few techniques I've thought of to mitigate prompt injections, though the larger models seem to have much less trouble with this. One option is label-conditioning, including a binary `[-1, 1]` label indicating whether text is a prompt or content.
 
 ### Artificial emotions
 Personally I believe these models already have a form of "emotion" emergent from the latent emotion of their language modeling capabilities. That is, if a model is writing text expressing an emotion, this is essentially the same thing as "real" emotions. The main problem for LLMs in this case is they tend to degenerate into neutral tonalities, possibly because they're slightly more likely. If we wanted to add a real emotional subsystem to them, we could add a set of labels (eg arousal and valence, or a more complicated dimensional model) indicating the kind of emotion and tone the model should be generating, which can be learned through fine tuning. Then, it can be given a similar label on its output which is meant to predict the affect of the text it sees in its context window. Finally, the output can be connected to the input to form a closed loop which can be changed arbitrarily. This would allow the model to generate text with a specific emotion and maintain a stable affect. This could have future consequences for the model's emotional intelligence and empathy, as well as a primitive form of reinforcement learning. For instance, novelty-seeking behavior can be encouraged by changing the affect to emulate boredom.
+
+A version of this can be easily simulated by a cognitive architecture which prompts the model to generate an emotion label along with its text, and provide that label to the next prompt.
 
 ### Robopsychology
 There will inevitably be a field of science dedicated to "robopsychology". A large part of this is in robopsychological engineering eg cognitive architectures, but a less explored avenue is the actual psychological aspect - how that relates to our own psychology, how to understand the "why" and "how" of their minds' functioning, and general explicability.
@@ -233,6 +236,19 @@ I'm unsure how to rectify imagination, if it's even a problem for larger models.
   - Very fitting name
 * [Generative Agents: Interactive Simulacra of Human Behavior](https://arxiv.org/abs/2304.03442)
   - Cognitive architecture for emergent social behaviors in a game-like setting
+
+## Misc thoughts
+
+### Personhood
+
+In thinking about cognitive architectures, I've come to the following definition of personhood (open to debate): An intelligent system which exhibits
+1. Sentience - Aka self-awareness, separates humans from non-human animals
+2. Subjective experience - Backdrop for an ego from a Buddhist perspective, a "story the system tells itself about itself"
+3. Preferences - Without preferences, no moral consideration really makes sense
+4. Autonomy - Preferences must necessarily be given to AI, but this precludes an AI whose preferences are predicated mostly or entirely on the preferences of others.
+5. Suffering - Moral consideration (and thus personhood) is predicated on the reduction of suffering
+
+Suffering is considered separately from preferences because while suffering can be considered a kind of negative preference, that lacks the viscerality I associate with suffering. Consider for example Boston Dynamics robots, which have the preference of following their directives, which human testers thwart to test fault tolerance. However, this can't be characterized as suffering because the robot simply adjusts its behavior to continue following the directive without any further consideration. A cognitive architecture capable of suffering would need some form of inner monologue or other method which enables rumination. Also possibly emotional simulation and frustration signals would help.
 
 ---
 
