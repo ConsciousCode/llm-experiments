@@ -4,7 +4,24 @@ A major problem with LLMs and the direction we're going with them is they aren't
 
 ```bash
 $ pip install -r requirements.txt
+```
+
+To run the knowledge distillation from a model to a clone with the FF layers replaced with discrete memory layers, run
+
+```bash
 $ python distill.py
+```
+
+To test the cognitive architecture, probably change `complete = ...` in `agent.py` to `complete_chatgpt` and run
+
+```bash
+$ python chat.py
+```
+
+Or if you want to get fancy, you can run a local model server with
+
+```bash
+$ python llm/server.py
 ```
 
 Nothing fancy right now, a barebones proof of concept for my discrete memory transformer idea. Replaces the feedforward layers with two variations of kNN database memory to decouple memorization from language modeling. `distill.py` clones GPT-2, replaces the FF layers with the discrete memory, and trains it with knowledge distillation on the original with FF layers.
