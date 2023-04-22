@@ -23,16 +23,22 @@ class Diatree:
 	'''
 	
 	def __init__(self, *children):
-		self.children = children
+		self.children = tuple(flatten(children))
 	
 	def __str__(self): return ''.join(self.children)
 	def __repr__(self): return f'Diatree{self.children!r}'
 	def __iter__(self): return iter(self.children)
 	def __len__(self): return len(self.children)
+	
 	def __add__(self, other):
 		if isinstance(other, str):
 			return Diatree(*self, other)
 		return Diatree(*self, *other)
+	
+	def __radd__(self, other):
+		if isinstance(other, str):
+			return Diatree(other, *self)
+		return Diatree(*other, *self)
 	
 	def __getitem__(self, x: int|slice):
 		if isinstance(x, slice):
@@ -71,5 +77,10 @@ class Diatree:
 		'''
 		return self.alter(x)
 	
+	def append(self, elem):
+		'''
+		Appends text to the last element of the chain.
+		'''
+		return self.alter(-1, self[-1] + elem)
 
 Diatree("Hello world")

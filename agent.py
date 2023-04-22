@@ -1,182 +1,193 @@
 from diatree import Diatree
-import sqlite3
-import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import openai
 import os
+from typing import Optional
+import time
+import pprint
 
-openai.api_key = os.environ["API_KEY"]
+import prompt
+import db
+from itertools import chain
+
+openai.api_key = os.environ.get("API_KEY", None)
 
 DEBUG = True
-NAME = "Orin"
+NAME = "Ziggy"
 LLM_ENGINE = "text-davinci-003"
 CHAT_LINES = 25
-DB_FILE = "agent.db"
+DB_FILE = "memory.db"
+PRESSURE = 1/2
 
-HELP = """
-Commands:
-  h/help
-  q/quit
-  debug
-  sql
-  dia/diatree
-"""
+def complete_chatgpt(prompt, engine=LLM_ENGINE, max_tokens=100, temperature=0.9, top_p=0.9, frequency_penalty=0.0, presence_penalty=0.0, stop=None):
+	stop = stop or []
+	stop.append("\n")
+	
+	response = openai.Completion.create(
+		engine=engine,
+		prompt=prompt,
+		max_tokens=max_tokens,
+		temperature=temperature,
+		top_p=top_p,
+		frequency_penalty=frequency_penalty,
+		presence_penalty=presence_penalty,
+		stop=stop,
+		stream=True
+	)
+	
+	for token in response:
+		yield token.choices[0].text
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS memory (
-	id INTEGER PRIMARY KEY AUTOINCREMENT,
-	msg TEXT,
-	time TIMESTAMP
-);
+complete = complete_chatgpt
 
-CREATE TABLE IF NOT EXISTS debug (
-	id INTEGER PRIMARY KEY AUTOINCREMENT,
-	msg TEXT,
-	time TIMESTAMP
-)
-"""
-INSERT_MEMORY = """
-INSERT INTO memory (msg, time) VALUES (?, ?)
-"""
-SELECT_MEMORY = f"""
-SELECT * FROM memory ORDER BY time DESC LIMIT {CHAT_LINES}
-"""
 @dataclass
-class Chatlog:
-	id: int
-	msg: str
-	time: float
+class Message:
+	name: str
+	time: float = field(default_factory=time.time)
 	
 	def __str__(self):
-		ts = time.strftime("%H:%M:%S", time.localtime(self.time))
-		return f"{ts} {self.msg}\n"
+		t = time.strftime("%H:%M:%S", time.localtime(self.time))
+		return f"{t} {self.onlyname()}"
+	
+	def onlyname(self):
+		return f"<{self.name}>"
 
-MEMORY_COUNT = "SELECT COUNT(*) FROM memory"
-INSERT_DEBUG = "INSERT INTO debug (msg, time) VALUES (?, ?)"
+def tee_impl(it, arr):
+	'''Tee an iterator into a list and return both.'''
+	for x in it:
+		arr.append(x)
+		yield x
 
-PROMPT = f"""\
-I am an autonomous agent named {NAME}. My heuristic imperative is to reduce Suffering, increase Prosperity, and increase Understanding. I am here to assist the user with their needs, even if their questions or requests may not directly reflect those needs or if they are not fully aware of what those needs are.
-
-The date is {time.strftime("%A, %B %d, %Y")}.
-
-CONVERSATION:
-
-"""
-
-SUMMARIZE = """\
-Given the following conversation, provide a salient summary:
-
-{input}
-
-SUMMARY:
-"""
+def tee(it):
+	'''Tee an iterator into a list and return both.'''
+	arr = []
+	return tee_impl(it, arr), arr
 
 class Agent:
 	def __init__(self):
 		self.name = NAME
-		self.conn = sqlite3.connect(DB_FILE)
-		self.cursor = self.conn.cursor()
+		self.db = db.Database(DB_FILE)
 		self.debug = DEBUG
-		
-		self.cursor.executescript(SCHEMA)
-		self.conn.commit()
-		
 		self.unsummarized = 0
+		self.lines = CHAT_LINES
 		
-		self.dprint(f"INIT agent {self.name}")
+		self.dprint(f"__init__({self.name!r})")
 		
-		self.add_memory("-- SYSTEM: Program reloaded --")
 		self.reload()
+		self.memory_add("-- SYSTEM: Program reloaded --")
 	
 	def dprint(self, msg):
-		self.cursor.execute(INSERT_DEBUG, (msg, time.time()))
-		self.conn.commit()
+		'''Debug print'''
+		
+		self.db.debug.insert(msg=msg, time=time.time()).commit()
 	
 	def reload(self):
-		self.dprint("RELOAD")
+		'''Reload the agent's most recent memories.'''
 		
-		self.cursor.execute(SELECT_MEMORY)
-		self.memory = [Chatlog(*x) for x in self.cursor.fetchall()][::-1]
-		self.diatree = Diatree(PROMPT, *(str(row) for row in self.memory))
+		self.dprint("reload()")
+		x = self.db.recent(self.lines)
+		print(x)
+		
+		self.reprompt(map(str, x))
 	
-	def add_memory(self, msg):
-		self.dprint(f"ADD memory {msg}")
+	def reprompt(self, dialog):
+		'''Rebuild the dialog tree for prompting.'''
 		
+		self.dialog = Diatree(prompt.master(self.name), dialog)
+	
+	def command(self, user, cmd, args):
+		'''Process a command.'''
+		
+		self.dprint(f"command({user!r}, {cmd!r}, {args!r})")
+		
+		match cmd:
+			case "sql":
+				try:
+					rows = self.db.execute(' '.join(args))
+					self.db.commit()
+					yield pprint.pformat([dict(row) for row in rows.fetchall()])
+					yield "\n"
+				except Exception as e:
+					self.dprint(f"SQL ERROR:\n{e}")
+					yield str(e)
+			case "sum"|"summary"|"summarize":
+				summary = f"[SUMMARY] {self.summarize()}"
+				self.add_memory(summary)
+				yield summary
+			case "dia"|"diatree":
+				yield from self.dialog
+			case "debug":
+				self.debug = not self.debug
+				yield f"Debug set to {self.debug}"
+			case _:
+				self.dprint(f"Unknown command {cmd}")
+				yield "Unknown command"
+	
+	def message_add(self, msg):
+		'''Add a chat message to the chat log.'''
+		
+		self.dprint(f"message_add({msg!r})")
+		
+		# Rolling chat log
+		self.reprompt(self.dialog[1:][-CHAT_LINES:] + msg)
+	
+	def memory_add(self, msg):
+		'''Add a memory to the database, which also adds to chat log.'''
+		
+		self.dprint(f"memory_add({msg!r})")
+		
+		ctime = time.time()
+		
+		# All memories are added to the internal chat log
 		self.unsummarized += 1
-		self.cursor.execute(INSERT_MEMORY, (msg, time.time()))
-		self.reload()
+		self.message_add(f"{time.strftime('%H:%M:%S', time.localtime(ctime))} {msg}")
+		return self.db.memory.insert(msg=msg, ctime=ctime).commit().lastrowid
 	
-	def summarize(self):
-		conv = str(self.diatree[1:])
+	def memory_stream(self, memory, id=None):
+		'''Stream an individual memory.'''
 		
-		self.dprint(f"SUMMARIZE {conv}")
+		total = []
+		# Add the base memory
+		memory = iter(memory)
+		id = id or self.memory_add(next(memory))
 		
-		response = openai.Completion.create(
-			engine=LLM_ENGINE,
-			prompt=SUMMARIZE.format(input=conv),
-			max_tokens=250,
-			temperature=0.2
-		)
-		return response.choices[0].text
+		# Continue iterating, concatenating new tokens
+		for m in memory:
+			self.db.memory.concat('msg', m, id=id).commit()
+			total.append(m)
+			yield m
+		
+		# Only add to the chat log after the memory is complete
+		self.message_add(''.join(total))
 	
-	def chat(self, name, msg):
-		if msg.startswith("/"):
-			self.dprint(f"COMMAND {msg}")
-			cmd, *args = msg.split(' ')
-			match cmd:
-				case "/h"|"/help":
-					return HELP
-				case "/q"|"/quit":
-					exit()
-				case "/sql":
-					try:
-						self.cursor.execute(' '.join(args))
-						self.conn.commit()
-						return str(self.cursor.fetchall())
-					except sqlite3.OperationalError as e:
-						self.dprint(f"SQL ERROR:\n{e}")
-						return str(e)
-				case "/dia"|"/diatree":
-					return str(self.diatree)
-				case "/debug":
-					self.debug = not self.debug
-				case _:
-					self.dprint(f"Unknown command {cmd}")
-					return "Unknown command"
-			
-			return "FALLTHROUGH"
+	def complete(self, prompt):
+		'''AI prompt completion.'''
 		
-		msg = f"<{name}> {msg}"
-		self.dprint(f"CHAT {msg}")
-		self.add_memory(msg)
-		self.diatree += f"{time.strftime('%H:%M:%S')} <{self.name}>"
-		response = f"<{self.name}>{self.complete()}"
-		self.add_memory(response)
+		self.dprint(f"complete({prompt!r})")
+		return complete(prompt)
+	
+	def summarize(self, dialog):
+		'''Summarize the current chat log.'''
 		
-		print("COUNT", self.unsummarized)
-		if self.unsummarized >= CHAT_LINES // 2:
+		conv = str(dialog)
+		self.dprint(f"summarize({conv!r})")
+		return self.complete(prompt.summarize(self.name, conv))
+	
+	def chat(self, user, msg):
+		'''Respond to the user's message.'''
+		
+		msg = f"{Message(user)} {msg}"
+		self.dprint(f"chat({msg!r})")
+		self.memory_add(f"\n{msg}")
+		
+		msg = Message(self.name)
+		yield msg.onlyname()
+		id = self.memory_add(f"\n{msg}")
+		yield from self.memory_stream(self.complete(str(self.dialog)), id)
+		
+		# Summarize every so often
+		if self.unsummarized >= CHAT_LINES * PRESSURE:
 			self.unsummarized = 0
-			summary = f"[SUMMARY] {self.summarize()}"
-			self.add_memory(summary)
-			if self.debug:
-				response += f"\n{summary}"
-		
-		self.reload()
-		
-		return response
-	
-	def complete(self, prompt=None):
-		if prompt is None:
-			prompt = self.diatree
-		prompt = str(prompt)
-		
-		self.dprint(f"COMPLETE {prompt}")
-		
-		response = openai.Completion.create(
-			engine=LLM_ENGINE,
-			prompt=prompt,
-			max_tokens=100,
-			#stop=["\n"],
-			temperature=0.9
-		)
-		return response.choices[0].text
+			yield from self.memory_stream(
+				chain(["[SUMMARY]"], self.summarize(self.dialog))
+			)
