@@ -1,2 +1,2 @@
-import build
-from . import server, client
+import sys
+sys.path.insert(0, 'llm')

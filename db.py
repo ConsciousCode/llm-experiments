@@ -38,7 +38,7 @@ class Memory:
 	
 	def __str__(self):
 		ts = time.strftime("%H:%M:%S", time.localtime(self.ctime))
-		return f"{ts} {self.msg}\n"
+		return f"{ts} {self.msg}"
 
 @dataclass
 class Debug:

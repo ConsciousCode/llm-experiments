@@ -15,14 +15,18 @@ WORKERS = 3
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DEBUG = True
 
-def repetition_penalty(logits, input_ids, penalty):
-	if abs(1 - penalty) < 1e-5:
-		return logits
-	
-	unique = torch.unique(input_ids, dim=-1).cuda()
-	for token_id in unique:
-		logits[0, token_id] /= penalty
-	return logits
+import numpy as np
+
+def repetition_penalty(logits, input_ids, frequency_penalty=1.0, presence_penalty=1.0):
+    unique_tokens, counts = torch.unique(input_ids, return_counts=True)
+    
+    if frequency_penalty:
+        logits[:, unique_tokens] /= frequency_penalty ** counts
+    
+    if presence_penalty:
+        logits[:, unique_tokens] -= presence_penalty
+
+    return logits
 
 def top_kp(
 	logits: torch.Tensor,
@@ -74,33 +78,35 @@ class LLMService(llm_pb2_grpc.LLM):
 		self.model = AutoModelForCausalLM.from_pretrained(model).to(device)
 		self.tokenizer = AutoTokenizer.from_pretrained(model)
 		self.device = device
-
-	def Complete(self, request_iterator, context):
+	
+	@torch.no_grad()
+	def Complete(self, request, context):
 		try:
-			for req in request_iterator:
-				top_k = clamp(int(req.top_k or 0), 0, self.model.config.vocab_size)
-				top_p = clamp(float(req.top_p or 0), 0, 1)
-				temperature = clamp(float(req.temperature or 1), 0, 1)
-				penalty = clamp(float(req.repetition_penalty or 1), 0, 1)
-				stop_tokens = req.stop_tokens or []
+			for req in request:
 				prompt = req.prompt or "\n"
-				length = clamp(int(req.length or 1), 1, self.model.config.n_positions)
+				max_tokens = clamp(int(req.max_tokens or 1), 1, self.model.config.n_positions)
+				temperature = clamp(float(req.temperature or 1), 0, 1)
+				top_k = clamp(int(req.top_k or 0), 0, self.model.config.vocab_size)
+				top_p = clamp(float(req.top_p or 1), 0, 1)
+				presence_penalty = clamp(float(req.presence_penalty or 0), 0, 1)
+				frequency_penalty = clamp(float(req.frequency_penalty or 0), 0, 1)
+				stop = req.stop or []
+				stop.append("<|endoftext|>")
 				
 				if DEBUG:
 					print("Request:", prompt)
-					print("  length =", length)
-					print("  temperature =", temperature)
-					print("  top_k =", top_k)
-					print("  top_p =", top_p)
-					print("  repetition_penalty =", penalty)
-					print("  stop_tokens =", stop_tokens)
+					print(f"  {max_tokens=}")
+					print(f"  {temperature=}")
+					print(f"  {top_k=}")
+					print(f"  {top_p=}")
+					print(f"  {presence_penalty=}")
+					print(f"  {frequency_penalty=}",)
+					print(f"  {stop=}")
 				
-				# Convert stop_tokens to corresponding token IDs
-				stop_token_ids = list(map(self.tokenizer.convert_tokens_to_ids, stop_tokens))
 				input_ids = self.tokenizer.encode(prompt, return_tensors='pt').to(self.device)
 
 				past_kv = None
-				for _ in range(length):
+				for _ in range(max_tokens):
 					output = self.model(
 						input_ids,
 						past_key_values=past_kv,
@@ -110,7 +116,7 @@ class LLMService(llm_pb2_grpc.LLM):
 					if past_kv is not None:
 						past_kv += output.past_key_values
 					
-					logits = repetition_penalty(logits, input_ids, penalty)
+					logits = repetition_penalty(logits, input_ids, frequency_penalty, presence_penalty)
 					logits /= temperature
 					logits = top_kp(logits, top_k, top_p)
 					P = torch.softmax(logits, dim=-1)
@@ -118,10 +124,9 @@ class LLMService(llm_pb2_grpc.LLM):
 					next_token_str = self.tokenizer.decode(next_token_id[0])
 					
 					if DEBUG:
-						print(next_token_str, end ="")
-						sys.stdout.flush()
-						
-					if next_token_id.item() in stop_token_ids:
+						print(next_token_str, end="", flush=True)
+					
+					if next_token_str in stop:
 						break
 					
 					yield llm_pb2.CompletionResponse(response=next_token_str)
@@ -133,52 +138,7 @@ class LLMService(llm_pb2_grpc.LLM):
 			tb.print_exception(e)
 			raise e
 	
-	def Complete_0(self, request_iterator, context):
-		try:
-			for req in request_iterator:
-				input_ids = self.tokenizer.encode(req.prompt, return_tensors ="pt").to(self.device)
-				stop_tokens = list(map(self.tokenizer.convert_tokens_to_ids, req.stop_tokens))
-				#if not stop_tokens:
-				#	stop_tokens = None
-				
-				eos_token = self.tokenizer.eos_token_id
-				pad_token = self.tokenizer.pad_token_id or eos_token
-				
-				past_kv = None
-				for _ in range(req.length):
-					output = self.model(
-						input_ids,
-						past_key_values=past_kv,
-						use_cache=True,
-					)
-					output = self.model.generate(
-						input_ids,
-						do_sample=True,
-						max_length=input_ids.shape[1] + 1,
-						temperature=req.temperature,
-						top_p=req.top_p,
-						repetition_penalty=req.repetition_penalty,
-						eos_token_id=eos_token,
-						pad_token_id=pad_token,
-						num_return_sequences=1,
-						use_cache=True,
-						past_key_values=past_kv,
-						return_dict_in_generate=True
-					)
-					print(output.past_key_values)
-					next_token = output[:, -1]
-					next_token_str = self.tokenizer.decode(next_token)
-					if next_token in stop_tokens:
-						break
-					
-					past_kv = output.past_key_values
-					
-					yield llm_pb2.CompletionResponse(response=next_token_str)
-					input_ids = torch.cat((input_ids, next_token.unsqueeze(0)), dim=1)
-		except Exception as e:
-			tb.print_exception(e)
-			raise e
-
+	@torch.no_grad()
 	def Embed(self, request, context):
 		try:
 			# Use transformers library to generate sentence embeddings

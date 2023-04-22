@@ -1,7 +1,10 @@
+# Importing this lets us "import" the proto file
+import grpc_tools.protoc
+import sys
+
 try:
 	import llm_pb2_grpc, llm_pb2
 except ImportError:
-	import grpc_tools.protoc
 	grpc_tools.protoc.main([
 		"grpc_tools.protoc",
 		"-I.",

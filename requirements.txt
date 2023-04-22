@@ -6,3 +6,7 @@ lightning
 transformers
 datasets
 tensorboard
+prompt-toolkit
+grpc
+grpc_tools
+openai

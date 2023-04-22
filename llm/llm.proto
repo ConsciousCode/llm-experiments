@@ -3,23 +3,20 @@ syntax = "proto3";
 package llm;
 
 service LLM {
-	// Streaming RPC for language model completions
 	rpc Complete (stream CompletionRequest) returns (stream CompletionResponse) {}
-
-	// Unary RPC for sentence embeddings
 	rpc Embed (EmbedRequest) returns (EmbedResponse) {}
 }
 
 message CompletionRequest {
 	string prompt = 1;
-	int32 length = 2;
+	int32 max_tokens = 2;
 	float temperature = 3;
 	float top_k = 4;
 	float top_p = 5;
-	float repetition_penalty=6;
-	repeated string stop_tokens = 7;
+	float frequency_penalty=6;
+	float presence_penalty=7;
+	repeated string stop = 8;
 }
-
 message CompletionResponse {
 	string response = 1;
 }
@@ -27,7 +24,6 @@ message CompletionResponse {
 message EmbedRequest {
 	string prompt = 1;
 }
-
 message EmbedResponse {
 	repeated float embed = 1;
 }
