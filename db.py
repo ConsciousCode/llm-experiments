@@ -1,22 +1,24 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional, Iterator
 import time
 import sqlite3
-import re
 from functools import cache
 import json
 
+# Reduce repetition
 TABLE = "CREATE TABLE IF NOT EXISTS"
 IDENT = "id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT"
 TIMER = "ctime TIMESTAMP NOT NULL, atime TIMESTAMP NOT NULL, access INTEGER NOT NULL DEFAULT 0"
 MEMORY = f"{IDENT}, {TIMER}"
+
+# Database schema
 SCHEMA = f"""
 {TABLE} log ({IDENT},
 	time TIMESTAMP NOT NULL,
 	level INTEGER NOT NULL,
 	message TEXT NOT NULL
 );
-{TABLE} state (
+{TABLE} state ( -- Basically a JSON object
 	key TEXT NOT NULL PRIMARY KEY,
 	value TEXT NOT NULL
 );
@@ -37,11 +39,34 @@ SCHEMA = f"""
 	value BLOB NOT NULL
 )
 """
+
 @cache
-def INSERT(table, fields):
+def sanitize(name: str) -> str:
+	'''Sanitize an identifier, raise an error if it's invalid'''
+	
+	if not isinstance(name, str):
+		raise TypeError(f"Expected str, got {type(name).__name__}")
+	if not name.isidentifier():
+		raise ValueError(f"Invalid identifier: {name}")
+	return name.lower()
+
+@cache
+def INSERT(table: str, fields: tuple[str, ...]) -> str:
 	'''Shorthand for INSERT statement'''
-	fields = fields.split(' ')
-	return f"INSERT INTO {table} ({', '.join(fields)}) VALUES ({', '.join('?' * len(fields))})"
+	
+	values = "?" * len(fields)
+	fields = ', '.join(map(sanitize, fields))
+	return f"INSERT INTO {sanitize(table)} ({fields}) VALUES ({values})"
+
+@cache
+def SELECT(col: str|tuple[str, ...], table: str, fields: tuple[str, ...]) -> str:
+	'''Shorthand for SELECT statement'''
+	
+	if isinstance(col, str):
+		col = (sanitize(col),)
+	col = ', '.join(map(sanitize, col))
+	pred = ' AND '.join(f"{sanitize(k)} = ?" for k in fields)
+	return f"SELECT {col} FROM {sanitize(table)} WHERE {pred}"
 
 @dataclass
 class Identified:
@@ -81,14 +106,18 @@ class AssociativeMemory(MemoryEntry):
 
 class StateProxy:
 	'''Proxy for the state table.'''
+	
 	def __init__(self, conn):
+		# Store connection not db to avoid ref loops
 		self.conn = conn
 		self.cache = {}
 	
 	def get(self, k: str, default=...):
+		'''Get a value from the state dict or an optional default.'''
+		
 		if k in self.cache:
 			return self.cache[k]
-		cur = self.conn.execute("SELECT value FROM state WHERE key = ?", (k,))
+		cur = self.conn.execute(SELECT('value', 'state', key=k))
 		if row := cur.fetchone():
 			val = json.loads(row[0])
 			self.cache[k] = val
@@ -99,6 +128,7 @@ class StateProxy:
 	
 	def reload(self):
 		'''Reload the cache.'''
+		
 		self.cache.clear()
 		cur = self.conn.execute("SELECT key, value FROM state")
 		for k, v in cur:
@@ -106,6 +136,7 @@ class StateProxy:
 	
 	def load_defaults(self, **kwargs):
 		'''Insert a default value if the key is not present.'''
+		
 		self.conn.executemany(
 			"INSERT OR IGNORE INTO state (key, value) VALUES (?, ?)",
 			[(k, json.dumps(v)) for k, v in kwargs.items()]
@@ -118,10 +149,7 @@ class StateProxy:
 		return k in self.cache or self.get(k, MISSING) is MISSING
 	
 	def __getitem__(self, k: str):
-		v = self.get(k)
-		if v == ...:
-			raise KeyError(k)
-		return v
+		return self.get(k)
 	
 	def __setitem__(self, x: str, y):
 		self.cache[x] = y
@@ -154,65 +182,90 @@ class Database:
 		self.origins = {}
 		self.state = StateProxy(self.conn)
 	
+	# Generic SQL methods
+	
 	def execute(self, sql, *params):
 		return self.conn.execute(sql, *params)
 	
+	def select(self, col, table, **kwargs):
+		'''Shorthand for select statement.'''
+		return self.execute(SELECT(col, table, tuple(kwargs.keys()), tuple(kwargs.values())))
+	
+	def insert(self, table, **kwargs):
+		'''Shorthand for insert statement.'''
+		cur = self.execute(INSERT(table, tuple(kwargs.keys())), tuple(kwargs.values()))
+		self.conn.commit()
+		return cur
+	
 	def commit(self):
+		'''Commit the current transaction.'''
 		self.conn.commit()
 		return self
 	
-	def _insert_lastrowid(self, table, fields, values):
-		cur = self.execute(INSERT(table, fields), values)
-		self.conn.commit()
-		return cur.lastrowid
+	# Specific database methods
 	
 	def origin(self, ident: int|str|Origin) -> Origin:
-		'''
-		Convert an id or name to an origin, may insert a new one.
-		'''
+		'''Convert an id or name to an origin, may insert a new one.'''
+		# Check if the origin needs work
 		if isinstance(ident, Origin):
-			return ident
-		other = self.origins.get(ident, None)
-		if isinstance(ident, str):
-			name, id = ident, other
-			if id is None:
-				cur = self.execute("SELECT id FROM origins WHERE name = ?", (ident,))
-				if row := cur.fetchone():
-					id = row[0]
-				else:
-					id = self._insert_lastrowid("origins", "name", (ident,))
-				name = ident
-		elif isinstance(ident, int):
-			id, name = ident, other
-			if name is None:
-				cur = self.execute("SELECT name FROM origins WHERE id = ?", (ident,))
-				if row := cur.fetchone():
+			if ident.id is None:
+				ident = origin.name
+			elif ident.name is None:
+				ident = origin.id
+			else:
+				return ident
+		
+		# Figure out what kind of origin we have
+		origin = self.origins.get(ident, None)
+		if isinstance(name := ident, str):
+			if origin is None:
+				row = self.select('id', 'origins', name=ident).fetchone()
+				id = row[0] if row else self.insert("origins", name=ident).lastrowid
+			else:
+				id = origin.id
+		elif isinstance(id := ident, int):
+			if origin is None:
+				if row := self.select('name', 'origins', id=ident).fetchone():
 					name = row[0]
 				else:
 					raise ValueError("No such origin")
-				id = ident
+			else:
+				name = origin.name
 		else:
-			raise TypeError("origin must be str or int")
+			raise TypeError("origin must be str|int|Origin(str|int)")
+		
+		# Update the cache and return
 		self.origins[name] = id
 		self.origins[id] = name
 		return Origin(id, name)
 	
 	def recent(self, lines: int) -> Iterator[ExplicitMemory]:
+		'''Get the `lines` most recent explicit memories.'''
+		# Sanitization
+		if not isinstance(lines, int):
+			raise TypeError("lines must be int")
+		
 		recent = self.execute(
-			f"SELECT * FROM explicit ORDER BY ctime DESC LIMIT {int(lines)}"
+			f"SELECT * FROM explicit ORDER BY ctime DESC LIMIT {lines}"
 		).fetchall()[::-1]
 		
 		for row in recent:
-			yield ExplicitMemory(*row[:4], self.origin(row[4]), *row[5:])
+			yield ExplicitMemory(
+				row.id, row.ctime, row.atime, row.access,
+				self.origin(row.origin), row.message, row.importance
+			)
 	
 	def log(self, level: int, msg: str) -> int:
-		return self._insert_lastrowid(
-			"log", "time level message", (time.time(), level, msg)
-		)
+		'''Insert a new log entry. Returns the id.'''
+		return self.insert("log",
+			time=time.time(), level=level, message=msg
+		).lastrowid
 	
 	def insert_explicit(self, memory: ExplicitMemory) -> int:
-		origin = self.origin(memory.origin).id
-		return self._insert_lastrowid(
-			"explicit", "ctime atime origin message importance",
-			(memory.ctime, memory.atime, origin, memory.message, memory.importance)
-		)
+		'''Insert an explicit memory. Returns the id.'''
+		return self.insert("explicit",
+			ctime=memory.ctime, atime=memory.atime, access=memory.access,
+			origin=self.origin(memory.origin).id,
+			message=memory.message,
+			importance=memory.importance
+		).lastrowid
