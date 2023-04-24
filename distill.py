@@ -18,6 +18,7 @@ from lightning.pytorch import Trainer, LightningModule
 
 print("import transformers")
 from transformers.models.gpt2 import GPT2LMHeadModel, GPT2TokenizerFast, GPT2Config
+from transformers.models.auto import AutoConfig, AutoModel, AutoTokenizer
 
 print("import datasets")
 from datasets import load_dataset
@@ -28,13 +29,12 @@ import re
 
 print("import model")
 import model
-import knn
 
 ###################
 ## Configuration ##
 ###################
 
-TEACHER = "gpt2"
+TEACHER = "databricks/dolly-v1-6b"
 CACHE_FILE = "dataloader-map.cache"
 DATASET = "ag_news"
 BATCHES = 4 # 8 exhausts my 12 GB VRAM with a mere 12 layers
@@ -46,6 +46,13 @@ os.environ["TOKENIZERS_PARALLELISM"] = "true"
 torch.set_float32_matmul_precision('medium')
 pl.seed_everything(42)
 
+print("Building student")
+
+config = AutoConfig.from_pretrained(TEACHER)
+#print(config)
+student = model.build_gptj(config)
+print(student)
+exit()
 def map_gpt2_to_mine(teacher):
 	student = (teacher
 		.replace("transformer.", "lm.")
@@ -66,12 +73,6 @@ config = teacher.config
 #exit()
 #print("Config:", config)
 
-print("Building student")
-
-student = model.DMGPT2Model(config)
-student = model.LanguageModel(config.vocab_size, config.n_embd, config.n_positions, student)
-#print(student)
-#exit()
 from db import Database
 from db.faiss import FaissIndex
 from db.pickle import PickleStore

@@ -10,3 +10,4 @@ prompt-toolkit
 grpc
 grpc_tools
 openai
+pygments

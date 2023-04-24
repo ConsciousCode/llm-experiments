@@ -5,16 +5,20 @@ from prompt_toolkit import prompt, PromptSession
 
 HELP = """
 Commands:
-  h/help
-  q/quit
-  debug
-  sql
-  dia/diatree
+  h/help - this list
+  q/quit - quit
+  sql ...code - execute SQL code
+  select/insert/update/delete [...code] - execute SQL code with the given verb
+  prompt - print the completion prompt as the AI will see it
+  state [key [value]] - get or set the agent's state dictionary
+  sum/summary/summarize - force a chatlog summary
+  level [level] - get or set the agent's log level (0-5 or QUIET, ERROR, WARN, DEBUG, INFO, VERBOSE)
 """
 
 def cli_type(it):
 	for token in it:
-		print(token, end='', flush=True)
+		for c in token:
+			print(c, end='', flush=True)
 
 def main():
 	agent = Agent()
@@ -28,8 +32,7 @@ def main():
 	while True:
 		msg = sess.prompt(f"<{name}> ")
 		if msg.startswith("/"):
-			agent.dprint(f"COMMAND {msg}")
-			cmd, *args = msg[1:].split(' ')
+			cmd, *args = msg[1:].strip().split(' ')
 			match cmd:
 				case "h"|"help": print(HELP)
 				case "q"|"quit": return

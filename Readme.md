@@ -12,11 +12,12 @@ To run the knowledge distillation from a model to a clone with the FF layers rep
 $ python distill.py
 ```
 
-To test the cognitive architecture, probably change `complete = ...` in `agent.py` to `complete_chatgpt` and run
+To test the cognitive architecture, maybe change `complete = ...` in `agent.py` to `complete_chatgpt` and run
 4
 ```bash
-$ python chat.py
+$ API_KEY=... python chat.py
 ```
+You can also add `ENGINE=...` for a different Chat GPT engine, or "grpc" for the local gRPC server.
 
 Or if you want to get fancy, you can run a local model server with
 

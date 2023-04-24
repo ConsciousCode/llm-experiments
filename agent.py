@@ -1,212 +1,316 @@
-from diatree import Diatree
 from dataclasses import dataclass, field
-import openai
-import os
 from typing import Optional, Iterator
 import time
-import pprint
 
 import prompt
 import db
-import llm.client as client
 from itertools import chain
+import re
+import json
+import printf
 
-openai.api_key = os.environ.get("API_KEY", None)
+from complete import complete
 
-DEBUG = True
-NAME = "Ziggy"
-LLM_ENGINE = "text-davinci-003"
+NAME = "Orin"
 CHAT_LINES = 25
 DB_FILE = "memory.db"
 PRESSURE = 1/2
+EMOTION = None#"disoriented"
 
-def complete_chatgpt(prompt, *, engine=LLM_ENGINE, max_tokens=100, temperature=0.9, top_k=0, top_p=0.9, frequency_penalty=0.0, presence_penalty=0.0, stop=None):
-	stop = stop or []
-	stop.append("\n")
-	
-	response = openai.Completion.create(
-		engine=engine,
-		prompt=prompt,
-		max_tokens=max_tokens,
-		temperature=temperature,
-		top_k=top_k,
-		top_p=top_p,
-		frequency_penalty=frequency_penalty,
-		presence_penalty=presence_penalty,
-		stop=stop,
-		stream=True
-	)
-	
-	for token in response:
-		yield token.choices[0].text
+LEVEL = prompt.LOG_LEVEL.index("debug")
 
-def complete_local(prompt, *, max_tokens=100, temperature=0.9, top_k=0, top_p=0.9, frequency_penalty=0.0, presence_penalty=0.0, stop=None):
-	stop = stop or []
-	stop.append("\n")
+class StreamCapture:
+	'''
+	Convert a list of patterns into a regex pattern that matches every prefix
+	of the total pattern, then applies this to a stream of tokens.
 	
-	response = client.complete(
-		prompt=prompt,
-		max_tokens=max_tokens,
-		temperature=temperature,
-		top_k=top_k,
-		top_p=top_p,
-		frequency_penalty=frequency_penalty,
-		presence_penalty=presence_penalty,
-		stop=stop
-	)
+	Example:
+		XYZ\s+=\s+(\d+)?\s* becomes
+		(?:X(?:Y(?:Z(?:\s+(?:=(?:\s+(?:((?P<END>\d+)))?)?)?)?)
+	'''
+	def __init__(self, pattern):
+		# Add inner parentheses to the last pattern to detect final match
+		pattern = [*pattern[:-1], f"(?P<END>{pattern[-1]})"]
+		pattern = "".join(f"(?:{p}" for p in pattern) + '?'.join(')' * len(pattern))
+		self.pattern = re.compile(pattern)
 	
-	yield from response
+	def capture(self, stream):
+		buf = ""
+		m = None
+		stream = iter(stream)
+		for token in stream:
+			buf += token
+			if m := self.pattern.search(buf):
+				# Stop searching if there can't be more
+				if m.end() < len(buf):
+					if m.lastgroup == "END": break
+					yield m[0]
+					buf = buf[m.end():]
+			else:
+				yield token
+			
+		if m:
+			# Yield either the match or its text if it's not full
+			yield m if m.lastgroup == "END" else m[0]
+			if buf := buf[m.end():]:
+				yield buf
+		yield from stream
 
-complete = complete_local
+IMPORTANCE_PARAM = StreamCapture([
+	*prompt.IMPORTANCE_TAG, "\s+", "=", "\s+", "(\d+)"
+])
+EMOTION_PARAM = StreamCapture([
+	*prompt.EMOTION_TAG, "\s+", "=", "\s+",
+	'"', "((?:(?:[^\\\\]+|\\\\.)*)+)", '"'
+])
+
+def tee(stream: Iterator) -> tuple[Iterator, list]:
+	'''Tee a stream into a list.'''
+	# Note to self: Stop deleting this! Just keep it around in case we
+	#  need it again.
+	def impl(stream, arr):
+		for item in stream:
+			arr.append(item)
+			yield item
+	arr = []
+	return impl(stream, arr), arr
 
 @dataclass
 class Message:
-	name: str
-	time: float = field(default_factory=time.time)
+	origin: db.Origin
+	message: Optional[str] = None
+	ctime: float = field(default_factory=time.time)
+	importance: Optional[int] = None
 	
 	def __str__(self):
-		t = time.strftime("%H:%M:%S", time.localtime(self.time))
-		return f"{t} {self.onlyname()}"
+		return f"{prompt.timestamp(self.ctime)} {self.output()}"
 	
-	def onlyname(self):
-		return f"<{self.name}>"
-
-def tee_impl(it, arr):
-	'''Tee an iterator into a list and return both.'''
-	for x in it:
-		arr.append(x)
-		yield x
-
-def tee(it):
-	'''Tee an iterator into a list and return both.'''
-	arr = []
-	return tee_impl(it, arr), arr
+	@staticmethod
+	def from_explicit(explicit: db.ExplicitMemory):
+		'''Convert an explicit message to a user message'''
+		return Message(explicit.origin, explicit.message, explicit.ctime, explicit.importance)
+	
+	def to_explicit(self) -> db.ExplicitMemory:
+		'''Convert a user message to an explicit message'''
+		return db.ExplicitMemory(None,
+			ctime=self.ctime, atime=self.ctime, access=0,
+			origin=self.origin, message=self.message, importance=self.importance
+		)
+	
+	def format_name(self):
+		if self.origin.name in {"SYSTEM", "SUMMARY"}:
+			return f"[{self.origin.name}]"
+		return f"<{self.origin.name}>"
+	
+	def output(self):
+		'''Output as viewed by the user'''
+		out = self.format_name()
+		if self.message is not None:
+			out += f" {self.message}"
+		return out
 
 class Agent:
 	def __init__(self):
-		self.name = NAME
 		self.db = db.Database(DB_FILE)
-		self.debug = DEBUG
-		self.unsummarized = 0
-		self.lines = CHAT_LINES
+		self.chatlog = []
 		
-		self.dprint(f"__init__({self.name!r})")
+		self.db.state.load_defaults(
+			name = NAME,
+			loglevel = LEVEL,
+			pressure = PRESSURE,
+			emotion = EMOTION,
+			unsummarized = 0,
+			lines = CHAT_LINES,
+		)
+		# Set during debugging so we don't summarize a bunch of reboots
+		self.db.state.unsummarized = 0
+		
+		self.debug(f"__init__({self.name!r})")
 		
 		self.reload()
-		self.add_memory(prompt.reload())
+		self.add_memory(self.message("SYSTEM", prompt.reload()))
 	
-	def dprint(self, msg):
+	@property
+	def name(self): return self.db.state.name
+	@property
+	def loglevel(self): return self.db.state.loglevel
+	@property
+	def pressure(self): return self.db.state.pressure
+	@property
+	def emotion(self): return self.db.state.emotion
+	@property
+	def unsummarized(self): return self.db.state.unsummarized
+	@property
+	def lines(self): return self.db.state.lines
+	
+	def message(self, origin, msg=None, importance=None) -> Message:
+		'''Create a message from a string'''
+		return Message(self.db.origin(origin), msg, time.time(), importance)
+	
+	def log(self, level: int, msg: str):
 		'''Debug print'''
 		
-		#print(msg)
-		self.db.debug.insert(msg=msg, time=time.time()).commit()
-	
-	def reload(self):
-		'''Reload the agent's most recent memories.'''
+		self.db.log(level, msg)
 		
-		self.dprint("reload()")
-		self.reprompt(f"\n{msg}" for msg in self.db.recent(self.lines))
+		if level <= self.loglevel:
+			printf.log(level, msg)
 	
-	def reprompt(self, dialog):
-		'''Rebuild the dialog tree for prompting.'''
-		
-		self.dialog = Diatree(prompt.master(self.name), dialog)
+	def error(self, msg): self.log(1, msg)
+	def warn(self, msg): self.log(2, msg)
+	def info(self, msg): self.log(3, msg)
+	def debug(self, msg): self.log(4, msg)
+	def verbose(self, msg): self.log(5, msg)
 	
 	def command(self, user: str, cmd: str, args: list[str]):
 		'''Process a command.'''
 		
-		self.dprint(f"command({user!r}, {cmd!r}, {args!r})")
+		self.debug(f"command({user!r}, {cmd!r}, {args!r})")
 		
-		match cmd:
+		match cmd.lower():
+			case "select"|"update"|"insert"|"delete":
+				yield from self.command(user, "sql", [cmd.upper(), *args])
 			case "sql":
 				try:
 					rows = self.db.execute(' '.join(args))
 					self.db.commit()
-					yield pprint.pformat([dict(row) for row in rows.fetchall()])
-					yield "\n"
+					print(rows)
+					printf.json([dict(row) for row in rows.fetchall()])
 				except Exception as e:
-					self.dprint(f"SQL ERROR:\n{e}")
-					yield str(e)
+					self.error(f"SQL ERROR: {e}")
+			case "state":
+				if len(args) == 0:
+					printf.json(self.db.state.cache)
+				elif len(args) == 1:
+					printf.json(self.db.state[args[0]])
+				else:
+					try:
+						value = json.loads(args[1])
+					except json.JSONDecodeError:
+						value = args[1]
+					self.db.state[args[0]] = value
+					self.info(f"Set state[{args[0]!r}] = {value!r}")
 			case "sum"|"summary"|"summarize":
-				summary = f"[SUMMARY] {self.summarize()}"
-				self.add_memory(summary)
-				yield summary
-			case "dia"|"diatree":
-				yield from self.dialog
-				yield "\n"
-			case "debug":
-				self.debug = not self.debug
-				yield f"Debug set to {self.debug}"
+				yield from self.summarize(self.chatlog)
+				yield '\n'
+			case "prompt":
+				yield self.build_prompt() + "\n"
+			case "level":
+				if len(args) > 0:
+					level = args[0].upper()
+					if level in prompt.LOG_LEVEL:
+						il = prompt.LOG_LEVEL.index(level)
+					else:
+						try:
+							il = int(level)
+						except ValueError:
+							self.error("Invalid log level")
+							return
+					
+					self.db.state.loglevel = il
+					self.info(f"level = {level} ({il})")
+				else:
+					il = self.loglevel
+					if il > len(prompt.LOG_LEVEL):
+						level = "verbose" + "+" * (il - len(prompt.LOG_LEVEL))
+					else:
+						level = prompt.LOG_LEVEL[il]
+					yield f"level = {level} ({il})\n"
 			case _:
-				self.dprint(f"Unknown command {cmd}")
-				yield "Unknown command"
+				self.error(f"Unknown command {cmd}")
+	
+	def build_prompt(self):
+		self.debug("build_prompt()")
+		return prompt.master(self.name, self.emotion) + '\n'.join(self.chatlog)
+	
+	def reload(self):
+		'''Reload the agent's most recent memories.'''
+		
+		self.debug("reload()")
+		self.chatlog = [str(Message.from_explicit(msg)) for msg in self.db.recent(self.lines)]
 	
 	def add_message(self, msg: str):
 		'''Add a chat message to the chat log.'''
 		
-		self.dprint(f"add_message({msg!r})")
+		self.debug(f"add_message({msg!r})")
+		self.db.state.unsummarized += 1
+		print("Update", self.db.state.unsummarized)
 		
 		# Rolling chat log
-		self.reprompt(self.dialog[1:][-CHAT_LINES:] + msg)
+		self.chatlog = self.chatlog[-CHAT_LINES:] + [msg]
 	
-	def add_memory(self, msg: str) -> int:
+	def add_memory(self, msg: Message) -> int:
 		'''Add a memory to the database, which also adds to chat log.'''
 		
-		self.dprint(f"add_memory({msg!r})")
-		
-		ctime = time.time()
+		yield '\n'
+		self.debug(f"add_memory({msg!r})")
 		
 		# All memories are added to the internal chat log
-		self.unsummarized += 1
-		self.add_message(f"\n{prompt.timestamp(ctime)} {msg}")
-		return self.db.memory.insert(msg=msg, ctime=ctime).commit().lastrowid
+		self.add_message(str(msg))
+		return self.db.insert_explicit(msg.to_explicit())
 	
-	def stream(self, memory: str, id: Optional[int]=None):
-		'''Stream an individual memory.'''
-		
-		total = []
-		# Add the base memory
-		memory = iter(memory)
-		id = id or self.add_memory(next(memory))
-		
-		# Continue iterating, concatenating new tokens
-		for m in memory:
-			self.db.memory.concat('msg', m, id=id).commit()
-			total.append(m)
-			yield m
-		
-		# Only add to the chat log after the memory is complete
-		self.add_message(''.join(total))
-	
-	def complete(self, prompt: str) -> str|Iterator[str]:
+	def complete(self, prompt: str):
 		'''AI prompt completion.'''
 		
-		self.dprint(f"complete({prompt!r})")
+		self.verbose(f"complete({prompt!r})")
 		return complete(prompt)
 	
-	def summarize(self, dialog: Diatree) -> str|Iterator[str]:
+	def summarize(self, dialog: str):
 		'''Summarize the current chat log.'''
 		
-		conv = str(dialog)
-		self.dprint(f"summarize({conv!r})")
-		return self.complete(prompt.summarize(self.name, conv))
+		self.verbose(f"summarize({dialog!r})")
+		
+		self.db.state.unsummarized = 0
+		importance = None
+		summary = []
+		
+		# Get the summary completion
+		stream = self.complete(prompt.summarize(self.name, dialog))
+		for token in IMPORTANCE_PARAM.capture(stream):
+			if isinstance(token, str):
+				yield token
+				summary.append(token)
+			else:
+				importance = token[1]
+		
+		# Update the importance
+		if importance:
+			print("Importance =", importance)
+			try:
+				importance = int(importance[0], 10)
+			except ValueError as e:
+				self.log(f"Invalid importance: {e}")
+				importance = None
+		
+		self.add_memory(self.message(prompt.SUMMARY_TAG, ''.join(summary), importance=importance))
 	
 	def chat(self, user: str, msg: str) -> Iterator[str]:
 		'''Respond to the user's message.'''
 		
-		msg = f"{prompt.name(user)} {msg}"
+		self.verbose(f"chat({user!r}, {msg!r})")
 		
-		self.dprint(f"chat({msg!r})")
-		self.add_memory(msg)
+		# Add user message
+		self.add_memory(self.message(user, msg))
 		
-		msg = prompt.name(self.name)
-		yield msg
-		id = self.add_memory(msg)
-		yield from self.stream(self.complete(str(self.dialog)), id)
+		# Process AI message
+		pending = self.message(self.name)
+		po = pending.output()
+		
+		completion = []
+		p = f"{self.build_prompt()}\n{po}"
+		stream = self.complete(p)
+		
+		yield po
+		
+		for token in EMOTION_PARAM.capture(stream):
+			if isinstance(token, str):
+				yield token
+				completion.append(token)
+			else:
+				self.db.state.emotion = token[1]
+		
+		pending.message = ''.join(completion)
+		self.add_memory(pending)
 		
 		# Summarize every so often
-		if self.unsummarized >= CHAT_LINES * PRESSURE:
-			self.unsummarized = 0
-			yield from self.stream(
-				chain(["[SUMMARY]"], self.summarize(self.dialog))
-			)
+		if self.unsummarized >= self.lines * self.pressure:
+			yield from self.summarize(self.build_prompt())
