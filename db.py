@@ -4,11 +4,13 @@ import time
 import sqlite3
 from functools import cache
 import json
+import numpy as np
 
 # Reduce repetition
 TABLE = "CREATE TABLE IF NOT EXISTS"
 IDENT = "id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT"
-TIMER = "ctime TIMESTAMP NOT NULL, atime TIMESTAMP NOT NULL, access INTEGER NOT NULL DEFAULT 0"
+FNOW = "INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))"
+TIMER = f"ctime {FNOW}, atime {FNOW}, access INTEGER NOT NULL DEFAULT 0"
 MEMORY = f"{IDENT}, {TIMER}"
 
 # Database schema
@@ -23,7 +25,10 @@ SCHEMA = f"""
 	value TEXT NOT NULL
 );
 {TABLE} origins ({IDENT},
-	name TEXT NOT NULL
+	name TEXT NOT NULL UNIQUE
+);
+{TABLE} tags ({IDENT},
+	name TEXT NOT NULL UNIQUE
 );
 {TABLE} explicit ({MEMORY},
 	origin INTEGER REFERENCES origins(id) NOT NULL,
@@ -37,6 +42,12 @@ SCHEMA = f"""
 {TABLE} associative ({MEMORY},
 	key BLOB NOT NULL,
 	value BLOB NOT NULL
+);
+{TABLE} associative_tags(
+	obj INTEGER REFERENCES associative(id) NOT NULL,
+	tag INTEGER REFERENCES tags(id) NOT NULL,
+	PRIMARY KEY (obj, tag),
+	UNIQUE (obj, tag)
 )
 """
 
@@ -52,21 +63,28 @@ def sanitize(name: str) -> str:
 
 @cache
 def INSERT(table: str, fields: tuple[str, ...]) -> str:
-	'''Shorthand for INSERT statement'''
-	
-	values = "?" * len(fields)
+	values = ', '.join("?" * len(fields))
 	fields = ', '.join(map(sanitize, fields))
 	return f"INSERT INTO {sanitize(table)} ({fields}) VALUES ({values})"
 
 @cache
 def SELECT(col: str|tuple[str, ...], table: str, fields: tuple[str, ...]) -> str:
-	'''Shorthand for SELECT statement'''
-	
 	if isinstance(col, str):
 		col = (sanitize(col),)
 	col = ', '.join(map(sanitize, col))
 	pred = ' AND '.join(f"{sanitize(k)} = ?" for k in fields)
 	return f"SELECT {col} FROM {sanitize(table)} WHERE {pred}"
+
+@cache
+def DELETE(table: str, where: Optional[str]=None) -> str:
+	s = f"DELETE FROM {sanitize(table)}"
+	return s if where is None else f"{s} WHERE {where}"
+
+@cache
+def UPDATE(table: str, fields: tuple[str, ...], where: Optional[str]=None) -> str:
+	fields = ', '.join(f"{sanitize(k)} = ?" for k in fields)
+	s = f"UPDATE {sanitize(table)} SET {fields}"
+	return s if where is None else f"{s} WHERE {where}"
 
 @dataclass
 class Identified:
@@ -189,7 +207,7 @@ class Database:
 	
 	def select(self, col, table, **kwargs):
 		'''Shorthand for select statement.'''
-		return self.execute(SELECT(col, table, tuple(kwargs.keys()), tuple(kwargs.values())))
+		return self.execute(SELECT(col, table, tuple(kwargs.keys())), tuple(kwargs.values()))
 	
 	def insert(self, table, **kwargs):
 		'''Shorthand for insert statement.'''
@@ -222,7 +240,7 @@ class Database:
 				row = self.select('id', 'origins', name=ident).fetchone()
 				id = row[0] if row else self.insert("origins", name=ident).lastrowid
 			else:
-				id = origin.id
+				id = origin
 		elif isinstance(id := ident, int):
 			if origin is None:
 				if row := self.select('name', 'origins', id=ident).fetchone():
@@ -230,7 +248,7 @@ class Database:
 				else:
 					raise ValueError("No such origin")
 			else:
-				name = origin.name
+				name = origin
 		else:
 			raise TypeError("origin must be str|int|Origin(str|int)")
 		
@@ -251,8 +269,8 @@ class Database:
 		
 		for row in recent:
 			yield ExplicitMemory(
-				row.id, row.ctime, row.atime, row.access,
-				self.origin(row.origin), row.message, row.importance
+				row['id'], row['ctime'], row['atime'], row['access'],
+				self.origin(row['origin']), row['message'], row['importance']
 			)
 	
 	def log(self, level: int, msg: str) -> int:
