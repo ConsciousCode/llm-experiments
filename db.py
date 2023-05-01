@@ -86,6 +86,10 @@ def UPDATE(table: str, fields: tuple[str, ...], where: Optional[str]=None) -> st
 	s = f"UPDATE {sanitize(table)} SET {fields}"
 	return s if where is None else f"{s} WHERE {where}"
 
+@cache
+def IN(name: str, count: int) -> str:
+	return f"{name} IN ({', '.join('?' * count)})"
+
 @dataclass
 class Identified:
 	id: int

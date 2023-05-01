@@ -3,3 +3,4 @@ lightning_logs/
 *.cache
 *.memmap
 *.db
+*.log
