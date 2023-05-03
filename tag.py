@@ -1,8 +1,6 @@
 import numpy as np
 import spacy
-from functools import cached_property
 from dataclasses import dataclass, field
-
 
 @dataclass
 class SpacyTags:
@@ -30,9 +28,9 @@ class Tagset:
 	tags: list[str]
 	context: 'list[str]|Tagset'
 	
-	@cached_property
-	def _len(self): return len(self.context) + len(self.tags)
-	def __len__(self): return self._len
+	def __len__(self):
+		return len(self.context) + len(self.tags)
+	
 	def __iter__(self):
 		yield from self.context
 		yield from self.tags
@@ -49,6 +47,11 @@ class MultiTagset:
 		for tags in self.tags:
 			yield Tagset(tags, self.context)
 	
+	def mask(self, mask):
+		for t, m in zip(self.tags, mask):
+			if m:
+				yield Tagset(t, self.context)
+	
 	def enter(self, tags):
 		'''Enter a new context.'''
 		return MultiTagset(self.tags, Tagset(tags, self.context))
@@ -60,7 +63,7 @@ class Tagger:
 		self.tokenizer = tokenizer
 		self.nlp = nlp
 	
-	def tag(self, text: str, context: list[str]) -> MultiTagset:
+	def tag(self, text: str, context: list[str]) -> tuple[np.ndarray, MultiTagset]:
 		tokens = self.tokenizer(text, return_offsets_mapping=True)
 		ids = np.array(tokens.input_ids)
 		doc = self.nlp(text)

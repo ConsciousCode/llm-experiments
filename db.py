@@ -1,54 +1,40 @@
-from dataclasses import dataclass
-from typing import Optional, Iterator
+from typing import Iterator
 import time
 import sqlite3
-from functools import cache
 import json
-import numpy as np
+
+from dataclasses import dataclass
+from functools import cache
+from typing import Optional
 
 # Reduce repetition
 TABLE = "CREATE TABLE IF NOT EXISTS"
-IDENT = "id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT"
-FNOW = "INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))"
-TIMER = f"ctime {FNOW}, atime {FNOW}, access INTEGER NOT NULL DEFAULT 0"
+INT = "INTEGER NOT NULL"
+TEXT = "TEXT NOT NULL"
+IDENT = f"id {INT} PRIMARY KEY AUTOINCREMENT"
+FNOW = f"{INT} DEFAULT (strftime('%s', 'now'))"
+TIMER = f"ctime {FNOW}, atime {FNOW}, access {INT} DEFAULT 0"
 MEMORY = f"{IDENT}, {TIMER}"
-
 # Database schema
 SCHEMA = f"""
 {TABLE} log ({IDENT},
-	time TIMESTAMP NOT NULL,
-	level INTEGER NOT NULL,
-	message TEXT NOT NULL
+	time {INT},
+	level {INT},
+	message {TEXT}
 );
 {TABLE} state ( -- Basically a JSON object
-	key TEXT NOT NULL PRIMARY KEY,
-	value TEXT NOT NULL
+	key {TEXT} PRIMARY KEY,
+	value {TEXT}
 );
 {TABLE} origins ({IDENT},
-	name TEXT NOT NULL UNIQUE
-);
-{TABLE} tags ({IDENT},
-	name TEXT NOT NULL UNIQUE
+	name {TEXT} UNIQUE
 );
 {TABLE} explicit ({MEMORY},
-	origin INTEGER REFERENCES origins(id) NOT NULL,
-	message TEXT NOT NULL,
+	origin {INT} REFERENCES origins(id),
+	message {TEXT},
 	--embedding BLOB NOT NULL,
 	importance INTEGER
 );
-{TABLE} featural ({MEMORY},
-	embedding BLOB NOT NULL
-);
-{TABLE} associative ({MEMORY},
-	key BLOB NOT NULL,
-	value BLOB NOT NULL
-);
-{TABLE} associative_tags(
-	obj INTEGER REFERENCES associative(id) NOT NULL,
-	tag INTEGER REFERENCES tags(id) NOT NULL,
-	PRIMARY KEY (obj, tag),
-	UNIQUE (obj, tag)
-)
 """
 
 @cache
@@ -62,10 +48,14 @@ def sanitize(name: str) -> str:
 	return name.lower()
 
 @cache
+def LIST(count: int) -> str:
+	return f"({', '.join('?' * count)})"
+
+@cache
 def INSERT(table: str, fields: tuple[str, ...]) -> str:
-	values = ', '.join("?" * len(fields))
+	values = LIST(len(fields))
 	fields = ', '.join(map(sanitize, fields))
-	return f"INSERT INTO {sanitize(table)} ({fields}) VALUES ({values})"
+	return f"INSERT INTO {sanitize(table)} ({fields}) VALUES {values}"
 
 @cache
 def SELECT(col: str|tuple[str, ...], table: str, fields: tuple[str, ...]) -> str:
@@ -88,7 +78,7 @@ def UPDATE(table: str, fields: tuple[str, ...], where: Optional[str]=None) -> st
 
 @cache
 def IN(name: str, count: int) -> str:
-	return f"{name} IN ({', '.join('?' * count)})"
+	return f"{name} IN {LIST(count)}"
 
 @dataclass
 class Identified:
@@ -134,17 +124,17 @@ class StateProxy:
 		self.conn = conn
 		self.cache = {}
 	
-	def get(self, k: str, default=...):
+	def get(self, k: str, default=KeyError):
 		'''Get a value from the state dict or an optional default.'''
 		
 		if k in self.cache:
 			return self.cache[k]
-		cur = self.conn.execute(SELECT('value', 'state', key=k))
+		cur = self.conn.execute("SELECT value FROM state WHERE key = ?", (k,))
 		if row := cur.fetchone():
 			val = json.loads(row[0])
 			self.cache[k] = val
 			return val
-		if default is ...:
+		if default is KeyError:
 			raise KeyError(k)
 		return default
 	
@@ -161,14 +151,13 @@ class StateProxy:
 		
 		self.conn.executemany(
 			"INSERT OR IGNORE INTO state (key, value) VALUES (?, ?)",
-			[(k, json.dumps(v)) for k, v in kwargs.items()]
+			((k, json.dumps(v)) for k, v in kwargs.items())
 		)
 		self.conn.commit()
 		self.reload()
 	
 	def __contains__(self, k: str):
-		MISSING = object()
-		return k in self.cache or self.get(k, MISSING) is MISSING
+		return k in self.cache or self.get(k, ...) is ...
 	
 	def __getitem__(self, k: str):
 		return self.get(k)
@@ -195,34 +184,15 @@ class StateProxy:
 		return repr(self.cache)
 
 class Database:
-	def __init__(self, path):
-		self.path = path
-		self.conn = sqlite3.connect(path)
+	def __init__(self, conn):
+		if isinstance(conn, str):
+			conn = sqlite3.connect(conn)
+		self.conn = conn
 		self.conn.row_factory = sqlite3.Row
 		self.conn.executescript(SCHEMA)
 		self.conn.commit()
 		self.origins = {}
 		self.state = StateProxy(self.conn)
-	
-	# Generic SQL methods
-	
-	def execute(self, sql, *params):
-		return self.conn.execute(sql, *params)
-	
-	def select(self, col, table, **kwargs):
-		'''Shorthand for select statement.'''
-		return self.execute(SELECT(col, table, tuple(kwargs.keys())), tuple(kwargs.values()))
-	
-	def insert(self, table, **kwargs):
-		'''Shorthand for insert statement.'''
-		cur = self.execute(INSERT(table, tuple(kwargs.keys())), tuple(kwargs.values()))
-		self.conn.commit()
-		return cur
-	
-	def commit(self):
-		'''Commit the current transaction.'''
-		self.conn.commit()
-		return self
 	
 	# Specific database methods
 	
@@ -241,13 +211,26 @@ class Database:
 		origin = self.origins.get(ident, None)
 		if isinstance(name := ident, str):
 			if origin is None:
-				row = self.select('id', 'origins', name=ident).fetchone()
-				id = row[0] if row else self.insert("origins", name=ident).lastrowid
+				row = self.conn.execute(
+					"SELECT id FROM origins WHERE name = ?", (ident,)
+				).fetchone()
+				if row:
+					id = row[0]
+				else:
+					# Brand new origin
+					cur = self.conn.execute(
+						"INSERT INTO origins (name) VALUES (?)", (ident,)
+					)
+					self.commit()
+					id = cur.lastrowid
 			else:
 				id = origin
 		elif isinstance(id := ident, int):
 			if origin is None:
-				if row := self.select('name', 'origins', id=ident).fetchone():
+				row = self.conn.execute(
+					"SELECT name FROM origins WHERE id = ?", (ident,)
+				).fetchone()
+				if row:
 					name = row[0]
 				else:
 					raise ValueError("No such origin")
@@ -267,27 +250,27 @@ class Database:
 		if not isinstance(lines, int):
 			raise TypeError("lines must be int")
 		
-		recent = self.execute(
+		recent = self.conn.execute(
 			f"SELECT * FROM explicit ORDER BY ctime DESC LIMIT {lines}"
 		).fetchall()[::-1]
 		
 		for row in recent:
-			yield ExplicitMemory(
-				row['id'], row['ctime'], row['atime'], row['access'],
-				self.origin(row['origin']), row['message'], row['importance']
-			)
+			yield ExplicitMemory(**row, origin=self.origin(row.origin))
 	
 	def log(self, level: int, msg: str) -> int:
 		'''Insert a new log entry. Returns the id.'''
-		return self.insert("log",
-			time=time.time(), level=level, message=msg
-		).lastrowid
+		cur = self.conn.execute(
+			"INSERT INTO log (time, level, message) VALUES (?, ?, ?)",
+			(time.time(), level, msg)
+		)
+		self.conn.commit()
+		return cur.lastrowid
 	
 	def insert_explicit(self, memory: ExplicitMemory) -> int:
 		'''Insert an explicit memory. Returns the id.'''
-		return self.insert("explicit",
-			ctime=memory.ctime, atime=memory.atime, access=memory.access,
-			origin=self.origin(memory.origin).id,
-			message=memory.message,
-			importance=memory.importance
-		).lastrowid
+		cur = self.conn.execute(
+			"INSERT INTO explicit (origin, message, importance) VALUES (?, ?, ?)",
+			(memory.origin.id, memory.message, memory.importance)
+		)
+		self.conn.commit()
+		return cur.lastrowid

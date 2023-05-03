@@ -1,14 +1,39 @@
-from pymilvus import connections, DataType, CollectionSchema, FieldSchema, Collection
-from abc import ABC, abstractmethod
-from typing import Sequence, Optional
 import numpy as np
-import numpy.lib.recfunctions as rcf
-from dataclasses import dataclass
-from common import default
 import faiss
-import time
-import db
-from functools import cache, cached_property, wraps
+import os
+import sqlite3
+from typing import Optional
+from functools import cache
+
+TABLE = "CREATE TABLE IF NOT EXISTS"
+INT = "INTEGER NOT NULL"
+ID = f"id {INT} PRIMARY KEY AUTOINCREMENT"
+TIME = f"{INT} DEFAULT (strftime('%s', 'now'))"
+SCHEMA = f"""
+{TABLE} tags (
+	id {ID},
+	name TEXT NOT NULL UNIQUE
+);
+{TABLE} implicit (
+	id {ID},
+	ctime {TIME},
+	atime {TIME},
+	access {INT} DEFAULT 0,
+	deleted {INT} DEFAULT 0,
+	key BLOB NOT NULL,
+	value BLOB NOT NULL
+);
+{TABLE} tagmap (
+	obj {INT} REFERENCES associative(id),
+	tag {INT} REFERENCES tags(id),
+	PRIMARY KEY (obj, tag),
+	UNIQUE (obj, tag)
+)
+"""
+
+@cache
+def LIST(count: int) -> str:
+	return f"({', '.join('?' * count)})"
 
 def wsum(e, d, default=None):
 	'''Weighted sum of embeddings e with distances d.'''
@@ -17,18 +42,15 @@ def wsum(e, d, default=None):
 		return ws
 	return np.where(np.isfinite(ws), ws, default)
 
-class DiscreteMemory:
-	'''Base class for discrete memory databases.'''
-	
-	VECTORS = None
+class AssociativeMemory:
+	'''Combined index and store for discrete associative memory.'''
 	
 	def __init__(self,
 			index,
 			store,
 			k: int=1,
 			recombine: Optional[float]=None,
-			novel: Optional[float]=None,
-			newmem: float=0.0
+			novel: Optional[float]=None
 		):
 		'''
 		Parameters:
@@ -37,7 +59,6 @@ class DiscreteMemory:
 			k: The number of results to return
 			recombine: The distance threshold for recombining similar vectors
 			novel: The distance threshold for memorizing novel vectors
-			newmem: Weight of new memory in recombination
 		'''
 		
 		self.index = index
@@ -45,19 +66,18 @@ class DiscreteMemory:
 		self.k = k
 		self.recombine = recombine
 		self.novel = novel
-		self.newmem = newmem
 		
-		common_rows = [
-			("ctime", np.float64),
-			("atime", np.float64),
-			("access", np.int64),
-			*((name, np.float32, (self.dim,)) for name in self.VECTORS)
-		]
-		
-		self.Row = np.dtype([("id", np.int64), *common_rows])
-		self.RowNoId = np.dtype(common_rows)
+		self.Row = np.dtype([
+			("id", np.uint64),
+			("ctime", np.uint64),
+			("atime", np.uint64),
+			("access", np.uint64),
+			('deleted', np.uint64),
+			("key", np.float32, (self.dim,)),
+			("value", np.float32, (self.dim,))
+		])
 	
-	def recombine_vectors(self, data, vectors, d, tags):
+	def recombine_vectors(self, data, keys, values, d, tags):
 		if self.recombine is None:
 			return
 		
@@ -68,175 +88,154 @@ class DiscreteMemory:
 		d = np.where(mask, d[rows], np.inf) # Mask non-recombined
 		recids = data['id'][mask] # ids which were recombined
 		
-		# Build recombined data for insertion
-		data = np.rec.fromarrays([
-			data['ctime'].min(dim=1, where=mask), # Oldest creation
-			data['atime'].max(dim=1, where=mask), # Newest access
-			data['access'].sum(dim=1, where=mask), # All accesses
-			*(wsum(data[n], d, v[rows]) for n, v in vectors.items())
-		], dtype=self.RowNoId)
+		wk = wsum(data['key'], d, keys[rows])
+		wv = wsum(data['value'], d, values[rows])
 		
 		# Delete the old vectors
 		self.index.delete(recids)
 		self.store.delete(recids)
 		
 		# Add the new recombined vectors
-		self.index.add(data[self.VECTORS])
-		ids = self.store.insert(data)
+		self.index.add(wk)
+		ids = self.store.insert(
+			ctime=data['ctime'].min(dim=1, where=mask), # Oldest creation
+			atime=data['atime'].max(dim=1, where=mask), # Newest access
+			access=data['access'].sum(dim=1, where=mask), # All accesses
+			key=wk, value=wv
+		)
 		
-		# Split int a list of arrays of old ids
+		# Split into a list of arrays of old ids
 		recids = np.split(recids, np.cumsum(np.sum(mask, axis=1))[:-1])
 		
 		# Combine the tags
 		self.store.merge_tags(recids, ids)
-		self.store.add_tags(ids, tags[rows])
+		self.store.add_tags(ids, tags.mask(rows))
 	
-	def insert_novel(self, vectors, d, tags):
+	def insert_novel(self, keys, values, d, tags):
 		if self.novel is None:
 			return
 		
-		mask = np.all(d > self.novel, axis=1) # Nothing similar
-		ids = self.store.create({n: v[mask] for n, v in vectors.item()})
-		self.store.add_tags(ids, tags[mask])
+		mask = (d > self.novel) & np.isfinite(d)
+		rows = np.all(mask, axis=1) # Nothing similar
+		ids = self.store.create(keys[rows], values[rows])
+		self.store.add_tags(ids, tags.mask(rows))
 	
-	def search(self, tags, q, **vectors):
-		d, i = self.index.search(q, self.k) # (batch, k)
-		data = self.store.get(i.reshape(-1)).reshape(i.shape)
+	def search(self, keys, values, tags):
+		d, i = self.index.search(keys, self.k) # (batch, k)
+		data = self.store.get(i.reshape(-1))
+		data = np.array(data, dtype=self.Row).reshape(i.shape)
+		d = np.where(data['deleted'] == 1, np.inf, d)
 		
-		self.recombine_vectors(data, vectors, d, tags)
-		self.insert_novel(vectors, d, tags)
+		self.recombine_vectors(data, keys, values, d, tags)
+		self.insert_novel(keys, values, d, tags)
 		
-		# Combine top-k results
-		return tuple(wsum(data[n], d, v) for n, v in vectors.items())
+		# Combine top-k 
+		keys = wsum(data['key'], d, keys)
+		values = wsum(data['value'], d, values)
+		return keys, values
 
-class FeaturalMemory(DiscreteMemory):
-	VECTORS = ["embedding"]
-	
-	def search(self, q, tags):
-		return super().search(tags, q, embedding=q)
-
-class AssociativeMemory(DiscreteMemory):
-	VECTORS = ["key", "value"]
-	
-	def search(self, k, v, tags):
-		return super().search(tags, k, key=k, value=v)
-
-class DMFaissIndex:
+class FaissIndex:
 	'''Faiss index for discrete memory.'''
 	
-	def __init__(self, dim, path):
+	def __init__(self, dim, path, factory="Flat"):
 		self.dim = dim
-		self.index = faiss.IndexFlatIP(dim)
 		self.path = path
-		self.deleted = np.empty((4096,), dtype=np.int64)
-		self.ndel = 0
-	
-	def add(self, vectors):
-		assert len(vectors.shape) == 2, f"Expected 2D array, got {vectors.shape}"
-		assert vectors.shape[1] == self.dim, f"Expected {self.dim}, got {vectors.shape[1]}"
-		
-		self.index.add(vectors)
-	
-	def search(self, vectors, k=1):
-		assert len(vectors.shape) == 2, f"Expected 2D array, got {vectors.shape}"
-		assert vectors.shape[1] == self.dim, f"Expected {self.dim}, got {vectors.shape[1]}"
-		
-		d, i = self.index.search(vectors, k)
-		deleted = np.isin(i, self.deleted) # Mask deletions
-		return np.where(deleted, np.inf, d), np.where(deleted, 0, i + 1)
-	
-	def delete(self, ids):
-		# Cache overflow, commit deletions
-		if self.ndel + len(ids) > len(self.deleted):
-			split = len(self.deleted) - self.ndel
-			ids, extra = ids[:split], ids[split:]
-			self.deleted[self.ndel:] = ids
-			self.index.remove_ids(self.deleted - 1)
-			# Store remainder
-			self.ndel = len(extra)
-			self.deleted[:self.ndel] = extra
+		if os.path.exists(path):
+			self.load()
 		else:
-			ndel = self.ndel + len(ids)
-			self.deleted[self.ndel: ndel] = ids
-			self.ndel = ndel
+			self.index = faiss.index_factory(dim, factory)
+	
+	def add(self, keys):
+		self.buffer.add(keys)
+	
+	def delete(self, keys):
+		'''Does nothing (other indexes might need to delete).'''
+		pass
+	
+	def search(self, keys, k=1):
+		return self.index.search(keys, k)
 	
 	def commit(self):
-		self.index.remove_ids(self.deleted[:self.ndel])
 		faiss.write_index(self.index, self.path)
-		self.ndel = 0
 	
 	def load(self):
 		self.index = faiss.read_index(self.path)
 
-class DMSqliteStore:
+def tobytes(x):
+	for row in x:
+		yield row.tobytes()
+
+def implicit_row_factory(row):
+	id, ctime, atime, access, key, value = row
+	return id, ctime, atime, access, np.frombuffer(key), np.frombuffer(value)
+
+class SqliteStore:
 	'''Sqlite store for discrete memory.'''
 	
-	def __init__(self, dim, path):
-		self.dim = dim
-		self.conn = db.connect(path)
-		self.conn.row_factory = self.row_factory
-		self.main_table = prefix
-		self.tags_table = f"{prefix}_tags"
-		self.conn.executescript(f"""
-			CREATE TABLE IF NOT EXISTS {self.PREFIX} (
-				id INTEGER PRIMARY KEY,
-				ctime REAL NOT NULL,
-				atime REAL NOT NULL,
-				access INTEGER NOT NULL,
-				{', '.join(f"{name} BLOB NOT NULL" for name in self.VECTORS)}
-			);
-			INSERT INTO {self.PREFIX} (id, ctime, atime, access) VALUES (0, 0, 0, 0);
-			CREATE TABLE IF NOT EXISTS {self.PREFIX}_tags (
-				obj INTEGER NOT NULL,
-				tag INTEGER NOT NULL,
-				PRIMARY KEY (obj, tag)
-			);
-		""")
-	
-	def row_factory(self, row):
-		id, ctime, atime, access, *vectors = row
-		return (id, ctime, atime, access, *map(np.frombuffer, vectors))
+	def __init__(self, conn):
+		self.conn = conn
+		self.conn.row_factory = implicit_row_factory
 	
 	def get(self, ids):
-		cur = self.conn.cursor()
-		cur.row_factory = self.row_factory
-		return np.array(self.conn.execute(
-			db.SELECT("*", self.main_table, db.IN('id', len(ids))), ids
-		).fetchall(), dtype=self.Row)
+		# Update access information
+		self.conn.executemany("""
+			UPDATE implicit SET
+				atime = strftime('%s', 'now'),
+				access = access + 1
+			WHERE id = ?
+		""", ids)
+		self.conn.commit()
+		# Query data
+		return self.conn.executemany(
+			"SELECT * FROM implicit WHERE id = ?", ids
+		).fetchall()
 	
 	def delete(self, ids):
-		self.conn.execute(db.DELETE(self.main_table, db.IN('id', len(ids))), ids)
+		self.conn.executemany(
+			"UPDATE implicit SET deleted = 1 WHERE id = ?", ids
+		)
+		self.conn.commit()
 	
-	def insert(self, data):
-		cur = self.conn.executemany(db.INSERT(self.main_table, data.dtype.names), data)
-		return np.arange(cur.lastrowid - len(data) + 1, cur.lastrowid + 1)
+	def insert(self, ctime, atime, access, key, value):
+		cur = self.conn.executemany("""
+			INSERT INTO implicit (ctime, atime, access, key, value)
+			VALUES (?, ?, ?, ?, ?)
+		""", zip(ctime, atime, access, tobytes(key), tobytes(value)))
+		self.conn.commit()
+		return np.arange(cur.lastrowid - len(ctime) + 1, cur.lastrowid + 1)
 	
-	def create(self, vectors: dict[str, np.ndarray]):
-		return self.insert(np.rec.fromarrays(
-			vectors.values(), dtype=[(n, np.float64, self.dim) for n in vectors]
-		))
+	def create(self, keys, values):
+		cur = self.conn.executemany(
+			"INSERT INTO implicit (key, value) VALUES (?, ?)",
+			zip(tobytes(keys), tobytes(values))
+		)
+		self.conn.commit()
+		return np.arange(cur.lastrowid - len(keys) + 1, cur.lastrowid + 1)
 	
-	def merge_tags(self, old: list[list[int]], new: list[int]):
-		for ids, nid, tag in zip(old, new, tag):
-			objin = db.IN('obj', len(ids))
+	def merge_tags(self, old, new):
+		for ids, nid in zip(old, new):
+			ids = list(ids)
 			
+			# Need to query using IN to get the COUNT
 			self.conn.execute(f"""
-				INSERT INTO {self.tags_table} (obj, tag, count)
-					SELECT ?, tag, SUM(count)
-					FROM tags WHERE {objin} GROUP BY tag
-			""", (nid, *ids))
-			self.conn.execute(
-				f"DELETE FROM {self.tags_table} WHERE {objin}", ids
+				INSERT INTO tagmap (obj, tag, count)
+				SELECT {nid}, tag, SUM(count)
+				FROM tags WHERE obj IN {LIST(len(ids))} GROUP BY tag
+			""", ids)
+			self.conn.executemany(
+				"DELETE FROM tagmap WHERE obj = ?", ids
 			)
 		self.conn.commit()
 	
-	def add_tags(self, ids: list[int], tags: list[list[str]]):
-		tt = self.tags_table
+	def add_tags(self, ids, tags):
 		for obj, ntags in zip(ids, tags):
 			self.conn.execute(f"""
-				INSERT OR REPLACE INTO {tt} (obj, tag, count)
-					SELECT ?, id, COALESCE({tt}.count, 0) + 1 FROM tags
-					LEFT JOIN {tt} ON {tt}.obj = ? AND {tt}.tag = tags.id
-					WHERE {db.IN('name', len(tags))}
-			""", (obj, *ntags))
+				INSERT OR REPLACE INTO tagmap (obj, tag, count)
+				SELECT ?1, id, COALESCE(tagmap.count, 0) + 1 FROM tags
+				LEFT JOIN tagmap ON tagmap.obj = ?1 AND tagmap.tag = tags.id
+				WHERE name = ?2
+			""", ((obj, tag) for tag in ntags))
+		self.conn.commit()
+	
+	def commit(self):
 		self.conn.commit()

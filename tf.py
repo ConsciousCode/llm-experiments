@@ -115,7 +115,7 @@ class ScaledDotProductSelector(nn.Module):
 		if self.bias is not None:
 			causal_mask = self.bias[:, :, klen - qlen : klen, :klen]
 			mask_value = torch.finfo(dtype).min
-			mask_value = torch.full([], mask_value, dtype=dtype).to(device)
+			mask_value = torch.full((), mask_value, dtype=dtype).to(device)
 			attn_weight = torch.where(causal_mask, attn_weight, mask_value)
 			
 			attn_mask = ctx.mask
@@ -128,7 +128,7 @@ class ScaledDotProductSelector(nn.Module):
 		if self.attn_dropout is not None:
 			attn_weight = self.attn_dropout(attn_weight.type(v.dtype))
 		
-		head_mask = ctx.head_mask
+		head_mask = ctx.head_maskcausal_mask
 		if head_mask is not None:
 			attn_weight = attn_weight * head_mask
 		
@@ -139,6 +139,78 @@ class ScaledDotProductSelector(nn.Module):
 			atv.append(attn_weight)
 		
 		return attn
+
+class AssociativeMemorySelector(nn.Module):
+	'''
+	Attention recontextualized as kNN memory. Replaces feed forwarde layers.
+	1. QKV projections
+	2. QK L2 norm, KV STE
+	3. Top-K for keys and their values
+	4. softmax(Q K^T) V attention on the results
+	
+	Transformer Feed-Forward Layers Are Key-Value Memories
+	https://arxiv.org/abs/2012.14913
+	
+	Augmenting Self-attention with Persistent Memory
+	https://arxiv.org/pdf/1907.01470.pdf
+	* Proves FF networks are equivalent to attention with static memory
+	
+	Attention Approximates Sparse Distributed Memory
+	https://arxiv.org/abs/2111.05498
+	* Theoretical basis for why FF might be both attention and memory
+	
+	Memorizing Transformers
+	https://arxiv.org/abs/2203.08913
+	* kNN memory, paper uses it as an alternative to recurrency
+	
+	Neural Turing Machines
+	https://arxiv.org/abs/1410.5401
+	* Read and write/erase heads, paper uses it for memory-augmented tasks
+	'''
+	
+	def __init__(self,
+	    	embed,
+			selector: Optional[nn.Module]=None,
+			max_seq: Optional[int]=None,
+			dropout: ConfigMod=DROP,
+			bias: bool=BIAS
+		):
+		'''
+		Parameters:
+			embed: Embedding dimension
+			selector: Selector module after memory lookup
+			max_seq: Maximum sequence length
+			dropout: Residual dropout
+			bias: Whether to use bias
+		'''
+		
+		super().__init__(
+			embed,
+			dropout=dropout,
+			bias=bias
+		)
+		self.selector = default(selector, lambda: ScaledDotProductSelector(max_seq))
+		
+		# sqrt of QK Norm init because we can't assume selector is a dot product
+		self.scale = nn.Parameter(torch.tensor(embed ** -0.25))
+	
+	def forward(self,
+	    	q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+			ctx: Context
+		) -> torch.Tensor:
+		# QK Norm and STE
+		q = F.normalize(q, dim=-1)
+		k = F.normalize(k, dim=-1).detach()
+		v = v.detach()
+		
+		mk, mv = ctx.associative.search(k, v)
+		
+		# STE
+		k.grad = mk.grad
+		v.grad = mv.grad
+		
+		q, k = q * self.scale, k * self.scale
+		return self.selector(q, k, v, ctx)
 
 class Residual(nn.ModuleList):
 	'''
@@ -180,9 +252,9 @@ class Instill(Residual):
 			x = x + layer(self._feedback(x, f[i], ctx), ctx)
 		return x
 
-class ResidualLayer(nn.Module):
+class TransformerLayer(nn.Module):
 	'''
-	Base class for layers which add to the residual. Mostly norms and dropout,
+	Base class for layers in a transformer. Mostly norms and dropout,
 	since some forms of attention don't even have the QKV projections.
 	
 	Attention Is All You Need
@@ -250,7 +322,7 @@ class ResidualLayer(nn.Module):
 		
 		return atn
 
-class MultiheadAttention(ResidualLayer):
+class MultiheadAttention(TransformerLayer):
 	'''
 	Normal mutli-headed attention with qkv and output projections.
 	'''
@@ -316,7 +388,7 @@ class MultiheadAttention(ResidualLayer):
 			q, k = self.rotary(q, k, ctx)
 		
 		# Caching for faster inference
-		cache = ctx.output.cache
+		cache = ctx.cache
 		if cache is not None:
 			past_k, past_v = cache
 			k = torch.cat((past_k, k), dim=-2)
@@ -330,128 +402,6 @@ class MultiheadAttention(ResidualLayer):
 		q, k, v = map(self._split_heads, (q, k, v))
 		x = self.selector(q, k, v, ctx)
 		return self._merge_heads(x)
-
-class AssociativeMemory(ResidualLayer):
-	'''
-	Discretized external memory query-and-update operation. The external memory
-	should approximate attention over arbitrarily large external memory vectors
-	for keys and values. Useful for high-level semantics and personalization.
-	
-	1. Query, key, and value projections
-	2. Query the memory using the key projection, returning top-1 keys and values
-	3. Compute attention using the query projection and the top-1 keys and values
-	4. Output projection 
-	
-	Memorizing Transformers
-	https://arxiv.org/abs/2203.08913
-	* kNN memory, paper uses it as an alternative to recurrency
-	
-	Neural Turing Machines
-	https://arxiv.org/abs/1410.5401
-	* Read and write/erase heads, paper uses it for memory-augmented tasks
-	'''
-	
-	def __init__(self,
-	    	embed,
-			selector: Optional[nn.Module]=None,
-			max_seq: Optional[int]=None,
-			dropout: ConfigMod=DROP,
-			bias: bool=BIAS
-		):
-		'''
-		Parameters:
-			embed: Embedding dimension
-			selector: selector module after memory lookup
-			max_seq: Maximum sequence length
-			dropout: Residual dropout
-			bias: Whether to use bias
-		'''
-		
-		super().__init__(
-			embed,
-			dropout=dropout,
-			bias=bias
-		)
-		self.qkv_proj = nn.Linear(embed, embed, bias)
-		self.selector = default(selector, lambda: ScaledDotProductSelector(max_seq))
-		
-		# sqrt of QK Norm init because we can't assume selector is a dot product
-		self.scale = nn.Parameter(torch.tensor(embed ** -0.25))
-	
-	def _forward(self, x, ctx):
-		q, k, v = self.qkv_proj(x)
-		
-		# QK Norm and STE
-		q = F.normalize(q, dim=-1)
-		k = F.normalize(k, dim=-1).detach()
-		v = v.detach()
-		
-		mk, mv = ctx.associative.search(k, v)
-		
-		# STE
-		k.grad = mk.grad
-		v.grad = mv.grad
-		
-		q, k = q * self.scale, k * self.scale
-		return self.selector(q, k, v, ctx)
-
-class FeaturalMemory(ResidualLayer):
-	'''
-	Discretized memory lookup. Finds the top-1 embeddings in the memory and
-	returns those embeddings. Useful for low-level syntax and features and
-	insinspired by the current usage of embedding to document databases like
-	Pinecone and Milvus.
-	
-	Attention recontextualized as kNN memory. Queries, inserts keys and
-	values, and returns the results of the query.
-	
-		Transformer Feed-Forward Layers Are Key-Value Memories
-		https://arxiv.org/abs/2012.14913
-		
-		Augmenting Self-attention with Persistent Memory
-		https://arxiv.org/pdf/1907.01470.pdf
-		* Proves FF networks are equivalent to attention with static memory
-		
-		Attention Approximates Sparse Distributed Memory
-		https://arxiv.org/abs/2111.05498
-		* Theoretical basis for why FF might be both attention and memory
-	'''
-	
-	def __init__(self,
-			embed: int,
-			*,
-			dropout: ConfigMod=DROP,
-			bias=BIAS
-		):
-		'''
-		Parameters:
-			embed: Embedding dimension
-			
-			prenorm: Whether to use pre-normalization
-			dropout: Residual dropout
-			postnorm: Whether to use post-normalization
-			
-			bias: Whether to use bias
-		'''
-		super().__init__(
-			embed,
-			dropout=dropout
-		)
-		self.query_proj = nn.Linear(embed, embed, bias)
-	
-	def _forward(self, x, ctx):
-		# We don't compute attention weights
-		attn = ctx.output.attention
-		if attn is not None:
-			attn.append(None)
-		
-		# QK Norm and STE
-		q = F.normalize(self.query_proj(x), dim=-1).detach()
-		
-		emb = ctx['featural'].search(q)
-		emb.grad = q.grad
-		
-		return emb
 
 class LanguageModel(nn.Module):
 	'''

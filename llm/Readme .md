@@ -1,0 +1,1 @@
+LLM gRPC interface to enable more rapid development. Running LLMs takes a long time to initialize, and if an error occurs in more experimental code all that initialization is thrown away and has to be done again. By communicating over gRPC, the LLM can exist in its own process and continue running even if the client crashes.
