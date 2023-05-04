@@ -3,27 +3,56 @@ syntax = "proto3";
 package llm;
 
 service LLM {
-	rpc Complete (stream CompletionRequest) returns (stream CompletionResponse) {}
+	rpc Tokenize (TokenizeRequest) returns (TokenizeResponse) {}
+	rpc TokenDecode (TokenizeResponse) returns (TokenizeRequest) {}
+	rpc Process (ProcessRequest) returns (ProcessResponse) {}
+	rpc Complete (CompletionRequest) returns (stream CompletionResponse) {}
 	rpc Embed (EmbedRequest) returns (EmbedResponse) {}
 }
 
+message Tensor {
+	repeated uint32 shape = 1;
+	repeated float data = 2;
+}
+
+message TokenizeRequest {
+	string text = 1;
+}
+message TokenizeResponse {
+	repeated uint32 tokens = 1;
+}
+
+message ProcessRequest {
+	bool return_hidden = 1;
+	bool return_attention = 2;
+	oneof input {
+		string text = 3;
+		Tensor tokens = 4;
+	}
+}
+message ProcessResponse {
+	repeated Tensor hidden = 2;
+	repeated Tensor attention = 3;
+	Tensor logits = 1;
+}
+
 message CompletionRequest {
-	string prompt = 1;
-	int32 max_tokens = 2;
+	string text = 1;
+	uint32 max_tokens = 2;
 	float temperature = 3;
 	float top_k = 4;
 	float top_p = 5;
-	float frequency_penalty=6;
-	float presence_penalty=7;
+	float frequency_penalty = 6;
+	float presence_penalty = 7;
 	repeated string stop = 8;
 }
 message CompletionResponse {
-	string response = 1;
+	string text = 1;
 }
 
 message EmbedRequest {
-	string prompt = 1;
+	string text = 1;
 }
 message EmbedResponse {
-	repeated float embed = 1;
+	Tensor embed = 1;
 }
