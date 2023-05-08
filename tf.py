@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-
 '''
 Common transformer classes and functions.
 '''
@@ -13,12 +12,12 @@ from dataclasses import dataclass, field
 
 from common import NORM, DROP, BIAS, default
 
-ConfigMod: TypeAlias = Optional[bool|float|nn.Module]
+ConfigMod: TypeAlias = Optional[bool|int|float|nn.Module]
 
 def mod_or_config(config: ConfigMod, default: float, mod: Type[nn.Module]):
 	'''Returns a module or a module initialized with a config.'''
 	
-	if isinstance(config, float):
+	if isinstance(config, (int, float)):
 		return mod(config) if config else None
 	if isinstance(config, bool):
 		return mod(default) if config else None
@@ -86,7 +85,7 @@ class RotaryEmbedding(nn.Module):
 class ScaledDotProductSelector(nn.Module):
 	'''Traditional softmax(Q K^T) V attention selector.'''
 	
-	def __init__(self, max_seq: Optional[int], dropout: ConfigMod=DROP):
+	def __init__(self, max_seq: Optional[int], dropout: ConfigMod=None):
 		'''
 		Parameters:
 			max_seq: Maximum sequence length
@@ -172,8 +171,7 @@ class AssociativeMemorySelector(nn.Module):
 	    	embed,
 			selector: Optional[nn.Module]=None,
 			max_seq: Optional[int]=None,
-			dropout: ConfigMod=DROP,
-			bias: bool=BIAS
+			dropout: ConfigMod=None
 		):
 		'''
 		Parameters:
@@ -181,15 +179,10 @@ class AssociativeMemorySelector(nn.Module):
 			selector: Selector module after memory lookup
 			max_seq: Maximum sequence length
 			dropout: Residual dropout
-			bias: Whether to use bias
 		'''
 		
-		super().__init__(
-			embed,
-			dropout=dropout,
-			bias=bias
-		)
-		self.selector = default(selector, lambda: ScaledDotProductSelector(max_seq))
+		super().__init__()
+		self.selector = default(selector, lambda: ScaledDotProductSelector(max_seq, dropout))
 		
 		# sqrt of QK Norm init because we can't assume selector is a dot product
 		self.scale = nn.Parameter(torch.tensor(embed ** -0.25))
@@ -264,9 +257,9 @@ class TransformerLayer(nn.Module):
 	def __init__(self,
 			embed: int,
 			*,
-			prenorm: ConfigMod=NORM,
-			dropout: ConfigMod=DROP,
-			postnorm: ConfigMod=NORM,
+			prenorm: ConfigMod=None,
+			dropout: ConfigMod=None,
+			postnorm: ConfigMod=None,
 			bias: bool=BIAS
 		):
 		'''
@@ -285,7 +278,7 @@ class TransformerLayer(nn.Module):
 		
 		self.prenorm = mod_or_config(prenorm, NORM, lambda eps: nn.LayerNorm(embed, eps))
 		self.resid_dropout = mod_or_config(dropout, DROP, nn.Dropout)
-		self.postnorm = mod_or_config(postnorm, NORM, lambda eps: nn.LayerNorm(embed, eps))
+		self.postnorm = postnorm and mod_or_config(postnorm, NORM, lambda eps: nn.LayerNorm(embed, eps))
 		self.out_proj = nn.Linear(embed, embed, bias)
 	
 	@abstractmethod
@@ -335,7 +328,7 @@ class MultiheadAttention(TransformerLayer):
 			max_seq: Optional[int]=None,
 			selector: Optional[nn.Module]=None,
 			
-			dropout: ConfigMod=DROP,
+			dropout: ConfigMod=None,
 			bias: bool=BIAS
 		):
 		'''
@@ -411,10 +404,9 @@ class LanguageModel(nn.Module):
 	def __init__(self,
 			vocab: int,
 			embed: int,
-			max_seq: int,
 			model: list[nn.Module],
-			dropout: Optional[nn.Module]=None,
-			postnorm: Optional[nn.Module]=None,
+			dropout: ConfigMod=None,
+			postnorm: ConfigMod=None,
 			dtype: Optional[torch.dtype]=None
 		):
 		'''
@@ -429,12 +421,12 @@ class LanguageModel(nn.Module):
 		super().__init__()
 		
 		self.embed = nn.Embedding(vocab, embed)
-		self.dropout = dropout
+		self.embed_dropout = mod_or_config(dropout, DROP, nn.Dropout)
 		self.lm = model
-		self.postnorm = postnorm
+		self.postnorm = mod_or_config(postnorm, NORM, lambda x: nn.LayerNorm((embed,), x))
 		# Tie lm_head and embed weights
 		self.lm_head = nn.Linear(vocab, embed, bias=False)
-		self.dtype = default(dtype, torch.float32)
+		self.dtype = dtype or torch.float32
 	
 	def tie_weights(self):
 		'''Tie lm_head and embed weights'''
@@ -467,8 +459,8 @@ class LanguageModel(nn.Module):
 			attention_mask = attention_mask.to(dtype=self.dtype)  # fp16 compatibility
 			attention_mask = (1.0 - attention_mask) * torch.finfo(self.dtype).min
 		
-		if self.dropout is not None:
-			x = self.dropout(x)
+		if self.embed_dropout is not None:
+			x = self.embed_dropout(x)
 		
 		x = self.lm(x, ctx)
 		

@@ -3,37 +3,46 @@ syntax = "proto3";
 package llm;
 
 service LLM {
-	rpc Tokenize (TokenizeRequest) returns (TokenizeResponse) {}
-	rpc TokenDecode (TokenizeResponse) returns (TokenizeRequest) {}
-	rpc Process (ProcessRequest) returns (ProcessResponse) {}
+	rpc Encode (Decoding) returns (Encoding) {}
+	rpc Decode (Encoding) returns (Decoding) {}
+	rpc Forward (ForwardRequest) returns (ForwardResponse) {}
 	rpc Complete (CompletionRequest) returns (stream CompletionResponse) {}
 	rpc Embed (EmbedRequest) returns (EmbedResponse) {}
 }
 
-message Tensor {
+message BoolTensor {
+	repeated uint32 shape = 1;
+	repeated bool data = 2;
+}
+message IntTensor {
+	repeated uint32 shape = 1;
+	repeated int32 data = 2;
+}
+message FloatTensor {
 	repeated uint32 shape = 1;
 	repeated float data = 2;
 }
 
-message TokenizeRequest {
+message Decoding {
 	string text = 1;
 }
-message TokenizeResponse {
+message Encoding {
 	repeated uint32 tokens = 1;
 }
 
-message ProcessRequest {
+message ForwardRequest {
 	bool return_hidden = 1;
 	bool return_attention = 2;
 	oneof input {
 		string text = 3;
-		Tensor tokens = 4;
+		IntTensor tokens = 4;
 	}
+	BoolTensor attention_mask = 5;
 }
-message ProcessResponse {
-	repeated Tensor hidden = 2;
-	repeated Tensor attention = 3;
-	Tensor logits = 1;
+message ForwardResponse {
+	repeated FloatTensor hidden = 2;
+	repeated FloatTensor attention = 3;
+	FloatTensor logits = 1;
 }
 
 message CompletionRequest {
@@ -48,11 +57,12 @@ message CompletionRequest {
 }
 message CompletionResponse {
 	string text = 1;
+	float score = 2;
 }
 
 message EmbedRequest {
 	string text = 1;
 }
 message EmbedResponse {
-	Tensor embed = 1;
+	FloatTensor embed = 1;
 }

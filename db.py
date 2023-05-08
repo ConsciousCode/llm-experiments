@@ -5,7 +5,9 @@ import json
 
 from dataclasses import dataclass
 from functools import cache
-from typing import Optional
+from typing import Optional, Mapping
+
+from collections.abc import MutableMapping
 
 # Reduce repetition
 TABLE = "CREATE TABLE IF NOT EXISTS"
@@ -116,72 +118,79 @@ class AssociativeMemory(MemoryEntry):
 	key: bytes
 	value: bytes
 
-class StateProxy:
+class StateProxy(MutableMapping):
 	'''Proxy for the state table.'''
 	
 	def __init__(self, conn):
 		# Store connection not db to avoid ref loops
-		self.conn = conn
-		self.cache = {}
+		self._conn = conn
+		self._cache = {}
 	
-	def get(self, k: str, default=KeyError):
+	def get(self, k: str, default=None):
 		'''Get a value from the state dict or an optional default.'''
 		
-		if k in self.cache:
-			return self.cache[k]
-		cur = self.conn.execute("SELECT value FROM state WHERE key = ?", (k,))
+		if k in self._cache:
+			return self._cache[k]
+		cur = self._conn.execute("SELECT value FROM state WHERE key = ?", (k,))
 		if row := cur.fetchone():
-			val = json.loads(row[0])
-			self.cache[k] = val
+			self._cache[k] = val = json.loads(row[0])
 			return val
-		if default is KeyError:
-			raise KeyError(k)
 		return default
+	
+	def update(self, mapping: Mapping[str, object]):
+		'''Mapping update.'''
+		
+		self._cache.update(mapping)
+		self._conn.executemany(
+			"INSERT OR REPLACE INTO state (key, value) VALUES (?, ?)",
+			mapping.items()
+		)
+		self._conn.commit()
 	
 	def reload(self):
 		'''Reload the cache.'''
 		
-		self.cache.clear()
-		cur = self.conn.execute("SELECT key, value FROM state")
+		self._cache.clear()
+		cur = self._conn.execute("SELECT key, value FROM state")
 		for k, v in cur:
-			self.cache[k] = json.loads(v)
+			self._cache[k] = json.loads(v)
 	
 	def load_defaults(self, **kwargs):
 		'''Insert a default value if the key is not present.'''
 		
-		self.conn.executemany(
+		self._conn.executemany(
 			"INSERT OR IGNORE INTO state (key, value) VALUES (?, ?)",
 			((k, json.dumps(v)) for k, v in kwargs.items())
 		)
-		self.conn.commit()
+		self._conn.commit()
 		self.reload()
 	
 	def __contains__(self, k: str):
-		return k in self.cache or self.get(k, ...) is ...
+		return self.get(k, ...) is ...
 	
 	def __getitem__(self, k: str):
 		return self.get(k)
 	
 	def __setitem__(self, x: str, y):
-		self.cache[x] = y
-		self.conn.execute(
+		self._cache[x] = y
+		self._conn.execute(
 			"INSERT OR REPLACE INTO state (key, value) VALUES (?, ?)",
 			(x, json.dumps(y))
 		)
-		self.conn.commit()
+		self._conn.commit()
 	
 	def __getattr__(self, name: str):
-		if name in {'conn', 'cache'}:
+		if name.startswith("_"):
 			return super().__getattr__(name)
 		return self[name]
 	
 	def __setattr__(self, name: str, value):
-		if name in {'conn', 'cache'}:
+		if name.startswith("_"):
 			return super().__setattr__(name, value)
 		self[name] = value
 	
 	def __repr__(self):
-		return repr(self.cache)
+		return repr(self._cache)
 
 class Database:
 	def __init__(self, conn):

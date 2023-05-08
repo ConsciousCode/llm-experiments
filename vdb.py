@@ -172,8 +172,8 @@ def implicit_row_factory(row):
 class SqliteStore:
 	'''Sqlite store for discrete memory.'''
 	
-	def __init__(self, conn):
-		self.conn = conn
+	def __init__(self, path):
+		self.conn = sqlite3.connect(path)
 		self.conn.row_factory = implicit_row_factory
 	
 	def get(self, ids):

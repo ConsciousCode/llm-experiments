@@ -7,13 +7,15 @@ import torch
 import torch.nn.functional as F
 from transformers.models.auto import AutoTokenizer, AutoModelForCausalLM
 import traceback as tb
+import tensor
+from typing import Optional, Final
 
-MODEL = "databricks/dolly-v2-7b"
-MODEL = "gpt2"
-PORT = f'unix://{os.getcwd()}/llm.sock'
-WORKERS = 3
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-DEBUG = True
+#MODEL = "databricks/dolly-v2-7b"
+MODEL: Final = "gpt2"
+PORT: Final = f'unix://{os.getcwd()}/llm.sock'
+WORKERS: Final = os.cpu_count()
+DEVICE: Final = "cuda" if torch.cuda.is_available() else "cpu"
+DEBUG: Final = True
 
 def clamp(x, lo, hi):
 	return max(lo, min(x, hi))
@@ -69,33 +71,32 @@ def top_kp(
 		logits[indices_to_remove] = filter_value
 	return logits
 
-'''
-message Tensor {
-	repeated uint32 shape = 1;
-	repeated float data = 2;
-}
-'''
-
-def tensor_to_proto(tensor):
-	return llm_pb2.Tensor(shape=tensor.shape, data=tensor.flatten().tolist())
-
 class LLMService(llm_pb2_grpc.LLM):
-	def __init__(self, model=None, device=None):
+	def __init__(self,
+	    	debug=DEBUG,
+		    port: Optional[int]=None,
+	    	model: Optional[str]=None,
+			device: Optional[str]=None,
+			workers: Optional[int]=None
+		):
 		super().__init__()
+		
+		self.debug = debug
+		self.port = port or PORT
 		model = model or MODEL
-		device = device or DEVICE
+		self.workers = workers or WORKERS
+		self.device = device or DEVICE
 		
 		print("Loading model", model)
-		self.model = AutoModelForCausalLM.from_pretrained(model).to(device)
+		self.model = AutoModelForCausalLM.from_pretrained(model).to(self.device)
 		self.tokenizer = AutoTokenizer.from_pretrained(model)
-		self.device = device
 	
-	def Tokenize(self, request, context):
+	def Encode(self, request, context):
 		try:
-			if DEBUG:
+			if self.debug:
 				print("Tokenize:", request.text)
 			
-			return llm_pb2.TokenizeResponse(
+			return llm_pb2.Encoding(
 				tokens=self.tokenizer.encode(request.text)
 			)
 		
@@ -103,11 +104,11 @@ class LLMService(llm_pb2_grpc.LLM):
 			tb.print_exception(e)
 			raise e
 	
-	def TokenDecode(self, request, context):
+	def Decode(self, request, context):
 		try:
-			if DEBUG:
-				print("TokenDecode:", request.tokens)
-			return llm_pb2.TokenizeRequest(
+			if self.debug:
+				print("Decode:", request.tokens)
+			return llm_pb2.Decoding(
 				text=self.tokenizer.decode(request.tokens)
 			)
 		
@@ -116,7 +117,7 @@ class LLMService(llm_pb2_grpc.LLM):
 			raise e
 	
 	@torch.no_grad()
-	def Process(self, request, context):
+	def Forward(self, request, context):
 		try:
 			return_hidden = request.return_hidden or False
 			return_attention = request.return_attention or False
@@ -124,35 +125,41 @@ class LLMService(llm_pb2_grpc.LLM):
 			if request.text:
 				text = request.text
 				input_ids = self.tokenizer.encode(text, return_tensors='pt')
+				attention_mask = torch.ones_like(input_ids)
 			elif request.tokens:
-				input_ids = torch.tensor(request.tokens.data, dtype=torch.int32)
-				input_ids = input_ids.reshape(tuple(request.tokens.shape))
-				if DEBUG:
-					text = self.tokenizer.decode(input_ids.view(-1))
+				input_ids = tensor.decode(request.tokens)
+				if self.debug:
+					text = self.tokenizer.decode(input_ids.reshape(-1))
+				if request.attention_mask:
+					attention_mask = tensor.decode(request.attention_mask)
+				else:
+					attention_mask = torch.ones_like(input_ids)
 			else:
 				raise ValueError("Must provide either text or tokens")
 			
 			input_ids = input_ids.to(self.device)
 			
-			if DEBUG:
-				print("Process:", text)
+			if self.debug:
+				print("Forward:", text)
 				print(f"  {return_hidden=}")
 				print(f"  {return_attention=}")
+				print(f"  {attention_mask=}")
 			
 			output = self.model(
 				input_ids,
+				attention_mask=attention_mask,
 				output_hidden_states=return_hidden,
 				output_attentions=return_attention,
 				return_dict=True
 			)
 			
-			fields = {"logits": tensor_to_proto(output.logits)}
+			fields = {"logits": tensor.encode(output.logits, 'f')}
 			if return_hidden:
-				fields["hidden"] = list(map(tensor_to_proto, output.hidden_states))
+				fields["hidden"] = [tensor.encode(h, 'f') for h in output.hidden_states]
 			if return_attention:
-				fields["attention"] = list(map(tensor_to_proto, output.attentions))
+				fields["attention"] = [tensor.encode(a, 'f') for a in output.attentions]
 			
-			return llm_pb2.ProcessResponse(**fields)
+			return llm_pb2.ForwardResponse(**fields)
 				
 		except Exception as e:
 			tb.print_exception(e)
@@ -171,7 +178,7 @@ class LLMService(llm_pb2_grpc.LLM):
 			stop = request.stop or []
 			stop.append("<|endoftext|>")
 			
-			if DEBUG:
+			if self.debug:
 				print("Complete:", text)
 				print(f"  {max_tokens=}")
 				print(f"  {temperature=}")
@@ -201,7 +208,7 @@ class LLMService(llm_pb2_grpc.LLM):
 				next_token_id = torch.multinomial(P, num_samples=1)
 				next_token_str = self.tokenizer.decode(next_token_id[0])
 				
-				if DEBUG:
+				if self.debug:
 					print(next_token_str, end="", flush=True)
 				
 				if next_token_str in stop:
@@ -210,7 +217,7 @@ class LLMService(llm_pb2_grpc.LLM):
 				yield llm_pb2.CompletionResponse(text=next_token_str)
 				input_ids = torch.cat((input_ids, next_token_id), dim=1)
 			
-			if DEBUG:
+			if self.debug:
 				print()
 		except Exception as e:
 			tb.print_exception(e)
@@ -219,24 +226,39 @@ class LLMService(llm_pb2_grpc.LLM):
 	@torch.no_grad()
 	def Embed(self, request, context):
 		try:
-			if DEBUG:
+			if self.debug:
 				print("Embed:", request.text)
 			
 			# Use transformers library to generate sentence embeddings
 			input_ids = self.tokenizer.encode(request.text, return_tensors='pt').to(self.device)
 			embed = self.model(input_ids).logits
-			return llm_pb2.EmbedResponse(embed=tensor_to_proto(embed))
+			return llm_pb2.EmbedResponse(embed=tensor.encode(embed, 'f'))
 		except Exception as e:
 			tb.print_exception(e)
 			raise e
 
-def main(model=None, device=None):
+def build_argparse():
+	import argparse
+	
+	ap = argparse.ArgumentParser(
+		description="Run a Large Language Model in a separate process which can be queried over gRPC."
+	)
+	ap.add_argument("-D", "--debug", action="store_true", help="Enable debug mode")
+	ap.add_argument("-p", "--port", type=str, default=PORT, help="Port to listen on")
+	ap.add_argument("-M", "--model", type=str, default=MODEL, help="Model name or path")
+	ap.add_argument("-d", "--device", type=str, default=DEVICE, help="Device to run model on")
+	ap.add_argument("-w", "--workers", type=int, default=WORKERS, help="Number of gRPC workers")
+	
+	return ap
+
+def main(argv):
+	args = build_argparse().parse_args(argv)
 	server = grpc.server(futures.ThreadPoolExecutor(max_workers=WORKERS))
-	llm_pb2_grpc.add_LLMServicer_to_server(LLMService(model, device), server)
+	llm_pb2_grpc.add_LLMServicer_to_server(LLMService(**vars(args)), server)
 	server.add_insecure_port(PORT)
 	print("Listening...")
 	server.start()
 	server.wait_for_termination()
 
 if __name__ == '__main__':
-	main(*sys.argv[1:])
+	main(sys.argv[1:])

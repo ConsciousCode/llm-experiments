@@ -1,238 +1,79 @@
 #!/usr/bin/env python3
 '''
-Distill GPT-2 to a model using static memory layers. No CLI, just run it.
+Distill a parent model to a clone with its FF layers replaced with discrete
+memory layers.
 '''
-# Prints to help my impatient ass know it's not dead
 
-print("import torch")
-import torch
-import torch.optim as optim
-from torch.utils.data import DataLoader
-import torch.nn as nn
-import torch.nn.functional as F
-
-print("import lightning")
-import lightning as pl
-from lightning.pytorch.callbacks import LearningRateMonitor, Callback
-from lightning.pytorch import Trainer, LightningModule
-
-print("import transformers")
-from transformers.models.gpt2 import GPT2LMHeadModel, GPT2TokenizerFast, GPT2Config
-from transformers.models.auto import AutoConfig, AutoModel, AutoTokenizer
-
-print("import datasets")
-from datasets import load_dataset
-
-from collections import OrderedDict
 import os
-import re
-
-print("import model")
+import lmkd
 import model
+from functools import cached_property
+from llm.client import GRPCModel
+from transformers.models.auto import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
-###################
-## Configuration ##
-###################
+TEACHER_NAME = "hf-internal-testing/tiny-random-gptj" #"databricks/dolly-v1-6b"
+DATASET_NAME = "ag_news"
 
-TEACHER = "databricks/dolly-v1-6b"
-CACHE_FILE = "dataloader-map.cache"
-DATASET = "ag_news"
-BATCHES = 4 # 8 exhausts my 12 GB VRAM with a mere 12 layers
-EPOCHS = 3
-LOG_STEPS = 8
+DEFAULT_K = 5
+RECOMBINE = 2/3
+NOVEL = 1/3
+TEMPERATURE = 1.0
+PORT = os.path.abspath("llm.sock")
 
-os.environ["TOKENIZERS_PARALLELISM"] = "true"
-
-torch.set_float32_matmul_precision('medium')
-pl.seed_everything(42)
-
-print("Building student")
-
-config = AutoConfig.from_pretrained(TEACHER)
-#print(config)
-student = model.build_gptj(config)
-print(student)
-exit()
-def map_gpt2_to_mine(teacher):
-	student = (teacher
-		.replace("transformer.", "lm.")
-		.replace(".c_attn.", ".attn.qkv_proj.")
-		.replace(".c_proj.", ".attn.out_proj.")
-		.replace("wte.", "embed.")
-	)
-
-	return re.sub(r"lm\.h\.(\d+)\.", r"lm.\1.DMTransformerBlock.", student)
-
-print("Loading teacher")
-
-teacher = GPT2LMHeadModel.from_pretrained(TEACHER)
-tokenizer = GPT2TokenizerFast.from_pretrained(TEACHER)
-tokenizer.pad_token = tokenizer.eos_token
-config = teacher.config
-#print(list(teacher.state_dict().keys()))
-#exit()
-#print("Config:", config)
-
-from db import Database
-from db.faiss import FaissIndex
-from db.pickle import PickleStore
-class TestDatabase(Database):
-	'''
-	Proof of concept database.
-	'''
-	
-	def __init__(self, dim, path):
-		super().__init__(FaissIndex(dim, path + ".index"), PickleStore(dim, path + ".store"))
-memory = knn.TestDatabase(config.n_embd, "test.db")
-
-#print("Config:", config)
-
-print("Transfer weights")
-
-student_state = OrderedDict()
-unused = set()
-for tk, tw in teacher.state_dict().items():
-	sk = map_gpt2_to_mine(tk)
-	if sk is None:
-		unused.add(tk)
-		continue
-	if 'proj' in sk and len(tw.shape) > 1:
-		tw = tw.T
-	student_state[sk] = tw
-unused |= set(teacher.state_dict().keys()) - set(student_state.keys())
-unused = set(x for x in unused if "mlp" not in x)
-print("Unused keys:", unused)
-
-student.load_state_dict(student_state, strict=False)
-
-class KnowledgeDistillationModel(pl.LightningModule):
+class LMKD(lmkd.Distill):
 	def __init__(self,
-		  teacher, student, memory, tokenizer, dataset,
-		  *,
-		  temperature=2.0,
-		  batch_size=8,
-		  max_length=1024
+	    	debug=None,
+		    device=None,
+		    *,
+			teacher_name=TEACHER_NAME,
+			dataset_name=DATASET_NAME,
+			k=DEFAULT_K,
+			recombine=RECOMBINE,
+			novel=NOVEL,
+			temperature=TEMPERATURE,
+			port=PORT
 		):
-		super().__init__()
-		self.teacher = teacher
-		self.student = student
-		self.memory = memory
-		self.tokenizer = tokenizer
-		self.dataset = dataset
-		self.batch_size = batch_size
-		self.max_length = max_length
+		super().__init__(debug, device)
+		
+		self.teacher_name = teacher_name
+		self.dataset_name = dataset_name
+		self.k = k
+		self.recombine = recombine
+		self.novel = novel
 		self.temperature = temperature
-		self.distill_loss = nn.KLDivLoss(reduction="batchmean")
-		self.ce_loss = nn.CrossEntropyLoss()
-
-	def training_step(self, batch, batch_idx):
-		input_ids, attention_mask = batch
-		input_ids = input_ids.reshape(self.batch_size, self.max_length)
-		attention_mask = attention_mask.reshape(self.batch_size, self.max_length)
-		
-		#input_ids = torch.stack(input_ids, dim=0)
-		#attention_mask = torch.stack(attention_mask, dim=0)
-		
-		# Teacher model output
-		with torch.no_grad():
-			teacher_logits = self.teacher(
-				input_ids=input_ids,
-				attention_mask=attention_mask
-			).logits
-
-		# Student model output
-		student_logits, output = self.student(
-			input_ids,
-			attention_mask=attention_mask,
-			static_memory=self.memory
-		)
-		
-		# Calculate distillation loss
-		distill_loss = self.distill_loss(
-			F.log_softmax(student_logits / self.temperature, dim=-1),
-			F.softmax(teacher_logits / self.temperature, dim=-1)
-		)
-		student_logits = student_logits.view(-1, student_logits.shape[-1])
-		teacher_logits = teacher_logits.view(-1, teacher_logits.shape[-1])
-		input_ids = input_ids.view(-1)
-		
-		student_loss = self.ce_loss(student_logits, input_ids)
-		teacher_loss = self.ce_loss(teacher_logits, input_ids)
-		
-		loss = distill_loss + student_loss
-		
-		self.log("train_loss/combined", loss)
-		self.log("train_loss/distill", distill_loss)
-		self.log("train_loss/ce_teacher", teacher_loss)
-		self.log("train_loss/ce_student", student_loss)
-		
-		return loss
-
-	def configure_optimizers(self):
-		return optim.Adam(self.student.parameters(), lr=1e-4)
-
-	def _collate(self, batch):
-		'''
-		Collates the inputs as (seq*batch,) tensors because of weirdness with
-		how torch handles parallelism, which can exhaust file descriptors:
-		https://github.com/pytorch/pytorch/issues/65198
-		'''
-		input_ids = [torch.tensor(item['input_ids']) for item in batch]
-		attention_mask = [torch.tensor(item['attention_mask']) for item in batch]
-
-		input_ids = torch.stack(input_ids, dim=0)
-		attention_mask = torch.stack(attention_mask, dim=0)
-		
-		return input_ids, attention_mask
-
-	def _dataloader(self, split):
-		def tokenize(dataset):
-			return self.tokenizer(dataset['text'],
-				truncation=True,
-				padding="max_length",
-				max_length=self.max_length
-			)
-		dataset = self.dataset[split].map(tokenize, batched=True, cache_file_name=CACHE_FILE)
-		return DataLoader(dataset, self.batch_size, num_workers=8, collate_fn=self._collate)
+		self.port = port
 	
-	def train_dataloader(self):
-		return self._dataloader("train")
+	@cached_property
+	def config(self):
+		return AutoConfig.from_pretrained(self.teacher_name)
+	
+	@cached_property
+	def batch_size(self):
+		return self.config.n_positions
+	
+	def teacher(self):
+		return GRPCModel(self.port)
+	
+	def student(self, state_dict=None):
+		orin = model.build_gptj(self.config)
+		print(orin)
+		if state_dict is None:
+			teacher = AutoModelForCausalLM.from_pretrained(self.teacher_name)
+			state_dict = model.clone_gptj(teacher)
+		
+		# Sanity check, there should be no unused keys
+		assert set(state_dict.keys()).issubset(orin.state_dict().keys())
+		
+		# strict=False to allow for missing keys
+		orin.load_state_dict(state_dict, strict=False)
+		return orin
+	
+	def tokenizer(self):
+		tokenizer = AutoTokenizer.from_pretrained(self.teacher_name)
+		return lambda text: tokenizer(text, return_tensors="pt")
+	
+	def dataset(self, split):
+		return self.dataset_name
 
-	def val_dataloader(self):
-		return self._dataloader("validation")
-
-	def test_dataloader(self):
-		return self._dataloader("test")
-
-class FrequentCheckpoint(Callback):
-	'''
-	Checkpoint mid-epoch, since they can last a long time.
-	'''
-	def __init__(self, save_steps: int, output_dir: str):
-		super().__init__()
-		self.save_steps = save_steps
-		self.output_dir = output_dir
-
-	def on_batch_end(self, trainer, pl_module):
-		global_step = trainer.global_step
-		if global_step % self.save_steps == 0:
-			ckpt_path = os.path.join(self.output_dir, f"checkpoint_step_{global_step}.ckpt")
-			trainer.save_checkpoint(ckpt_path)
-			print(f"Checkpoint saved at step {global_step}: {ckpt_path}")
-
-block_size = config.n_positions
-dataset = load_dataset(DATASET)
-
-print("Begin training")
-
-# Train the model
-model = KnowledgeDistillationModel(
-	teacher, student, memory, tokenizer, dataset,
-	max_length=config.n_positions,
-	batch_size=BATCHES
-)
-trainer = pl.Trainer(accelerator="gpu", max_epochs=EPOCHS, log_every_n_steps=LOG_STEPS, callbacks=[
-	LearningRateMonitor(logging_interval='step'),
-	FrequentCheckpoint(save_steps=1000, output_dir="checkpoints")
-])
-trainer.fit(model)
+if __name__ == "__main__":
+	lmkd.main()
